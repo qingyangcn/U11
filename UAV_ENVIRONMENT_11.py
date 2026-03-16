@@ -231,6 +231,27 @@ class StateManager:
 
         drone = self.env.drones[drone_id]
         old_status = drone['status']
+
+        # Guard: refuse IDLE transition when the drone still holds PICKED_UP/in-progress orders.
+        # This prevents the PICKED_UP + IDLE state-consistency anomaly.
+        if new_status == DroneStatus.IDLE:
+            serving_order_id = drone.get('serving_order_id')
+            if serving_order_id is not None and serving_order_id in self.env.orders:
+                order = self.env.orders[serving_order_id]
+                if order['status'] == OrderStatus.PICKED_UP:
+                    print(
+                        f"[GUARD] Refusing IDLE transition for drone {drone_id}: "
+                        f"still holds PICKED_UP serving_order {serving_order_id}"
+                    )
+                    return False
+            for oid in list(drone.get('cargo', set())):
+                if oid in self.env.orders and self.env.orders[oid]['status'] == OrderStatus.PICKED_UP:
+                    print(
+                        f"[GUARD] Refusing IDLE transition for drone {drone_id}: "
+                        f"cargo contains PICKED_UP order {oid}"
+                    )
+                    return False
+
         drone['status'] = new_status
 
         if target_location is not None:
@@ -2044,6 +2065,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 强制状态同步
         self._force_state_synchronization()
 
+        # 严格一致性检查（同步修复之后执行，避免误报瞬态异常）
+        self._run_post_sync_consistency_check()
+
         # 更新系统状态（扩展点）
         self._update_system_state()
 
@@ -3312,7 +3336,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if self.enable_random_events:
             self._handle_random_events()
 
-        # Task B: State consistency checking with categorized debug logging
+    def _run_post_sync_consistency_check(self):
+        """Run strict state consistency check after _force_state_synchronization().
+
+        This is called from step() after repair so that transient states created
+        during event processing (e.g. PICKED_UP + IDLE) have already been resolved
+        before any issue is reported.
+        """
         consistency_issues = self.state_manager.get_state_consistency_check()
 
         if self.debug_state_warnings:
@@ -3772,7 +3802,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                                 self.state_manager.update_drone_status(
                                     drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
                                 )
-                                return
+                            else:
+                                # Pickup succeeded but customer location is missing – undo pickup
+                                # so the order can be re-routed rather than leaving the drone IDLE
+                                # with a PICKED_UP order in cargo (the PICKED_UP + IDLE anomaly).
+                                drone['cargo'].discard(serving_order_id)
+                                self._reset_order_to_ready(serving_order_id,
+                                                           "task_selection_no_customer_location")
+                                drone['serving_order_id'] = None
+                                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                                       target_location=None)
+                            return
 
                 # If we couldn't perform pickup, release the ASSIGNED order back to READY
                 # so it can be re-assigned to another drone.
