@@ -1317,7 +1317,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.last_step_reward_components = {
             'obj0_total': 0.0,
             'obj0_completed': 0.0,
+            # obj0_cancelled is always 0 (cancel penalty moved exclusively to Obj2)
             'obj0_cancelled': 0.0,
+            # obj0_progress_shaping is always 0 (progress shaping removed from Obj0)
             'obj0_progress_shaping': 0.0,
             'obj1_total': 0.0,
             'obj1_energy_cost': 0.0,
@@ -1350,6 +1352,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
         self.shaping_energy_k = float(shaping_energy_k)
+
+        # ========== 三目标奖励系数（解耦版）==========
+        # Obj0 (吞吐/效率): r0 = reward_a * Δcompleted
+        self.reward_a = 2.0   # completed 奖励系数
+        # Obj1 (运营成本): r1 = -(reward_b * Δenergy + reward_c * Δdistance)
+        self.reward_b = 0.03  # 能耗成本系数
+        self.reward_c = 0.003 # 距离成本系数
+        # Obj2 (服务质量): r2 = reward_d * Δon_time - reward_e * Δcancel - reward_f * log(1+backlog)
+        self.reward_d = 2.0   # 准时奖励系数
+        self.reward_e = 1.0   # 取消惩罚系数（仅 Obj2）
+        self.reward_f = 0.02  # backlog 惩罚系数（log 饱和）
         self.heading_guidance_alpha = float(np.clip(heading_guidance_alpha, 0.0, 1.0))
         self._prev_target_dist = np.zeros(self.num_drones, dtype=np.float32)
         # Track previous target location for each drone to detect target changes
@@ -2959,7 +2972,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             progress = (prev_dist - new_dist)
             progress_contribution = self.shaping_progress_k * float(progress)
-            r[0] += progress_contribution
+            # NOTE: progress shaping is NO LONGER added to r[0] (Obj0).
+            # Obj0 only tracks completed deliveries (r0 = a * Δcompleted).
+            # progress_shaping is computed here only for potential future use / analysis.
             progress_shaping += progress_contribution
 
             # REMOVED: Speed-based and battery_consumption_rate-based shaping to avoid
@@ -2976,17 +2991,26 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Update prev_dist for next step
             self._prev_target_dist[d] = new_dist
 
-        # Track progress shaping for diagnostics
-        self.last_step_reward_components['obj0_progress_shaping'] = float(progress_shaping)
+        # Progress shaping is disabled for Obj0; always record 0.
+        self.last_step_reward_components['obj0_progress_shaping'] = 0.0
 
         return r
 
     def _calculate_three_objective_rewards(self):
         """
-        三目标语义单一：
-        - obj0: 吞吐/效率（完成数、距离效率结算、取消惩罚等）
-        - obj1: -成本（距离、能耗等纯负成本）
-        - obj2: 服务质量（准时、取消、积压）
+        解耦三目标奖励（研究导向重构版）：
+        - Obj0 (吞吐/效率):  r0 = a * Δcompleted
+        - Obj1 (运营成本):   r1 = -(b * Δenergy + c * Δdistance)
+        - Obj2 (服务质量):   r2 = d * Δon_time - e * Δcancel - f * log(1 + backlog)
+
+        系数（可调，存于环境属性）：
+          a=reward_a=2.0, b=reward_b=0.03, c=reward_c=0.003
+          d=reward_d=2.0, e=reward_e=1.0,  f=reward_f=0.02
+
+        设计原则：
+          - 取消惩罚仅在 Obj2 中计算，避免 Obj0/Obj2 双重重罚。
+          - backlog 使用 log(1+backlog) 饱和惩罚，防止高负载时信号崩溃。
+          - progress shaping 已从 Obj0 中移除。
         """
         rewards = np.zeros(self.num_objectives, dtype=np.float32)
 
@@ -3008,23 +3032,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.last_stats['cancelled'] = current_cancelled
         self.last_stats['distance'] = current_distance
 
-        # obj0：吞吐/效率
-        completed_reward = float(delta_completed) * 2.0
-        cancelled_penalty_obj0 = float(delta_cancelled) * 2.0
+        # Obj0: 吞吐/效率 — 仅完成量，无取消惩罚，无 progress shaping
+        completed_reward = float(delta_completed) * self.reward_a
         rewards[0] += completed_reward
-        rewards[0] -= cancelled_penalty_obj0
 
-        # obj1：-成本（纯负成本）
-        energy_cost = float(delta_energy) * 0.01
-        distance_cost = float(delta_distance) * 0.001
+        # Obj1: 运营成本（纯负值）
+        energy_cost = float(delta_energy) * self.reward_b
+        distance_cost = float(delta_distance) * self.reward_c
         rewards[1] -= energy_cost
         rewards[1] -= distance_cost
 
-        # obj2：服务质量
-        on_time_reward = float(delta_on_time) * 1.5
-        cancelled_penalty_obj2 = float(delta_cancelled) * 1.0
+        # Obj2: 服务质量 — 准时 + 取消惩罚 + backlog log 饱和惩罚
+        on_time_reward = float(delta_on_time) * self.reward_d
+        cancelled_penalty_obj2 = float(delta_cancelled) * self.reward_e
         backlog = len(self.active_orders)
-        backlog_penalty = float(backlog) * 0.05
+        backlog_penalty = self.reward_f * math.log(1.0 + backlog)
         rewards[2] += on_time_reward
         rewards[2] -= cancelled_penalty_obj2
         rewards[2] -= backlog_penalty
@@ -3032,7 +3054,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Track reward components for diagnostics
         self.last_step_reward_components.update({
             'obj0_completed': completed_reward,
-            'obj0_cancelled': -cancelled_penalty_obj0,
+            'obj0_cancelled': 0.0,   # always 0: cancel penalty is Obj2-only
             'obj1_energy_cost': -energy_cost,
             'obj1_distance_cost': -distance_cost,
             'obj2_on_time': on_time_reward,
@@ -5154,15 +5176,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         rc = self.last_step_reward_components
         print(f"  Obj0 (Throughput/Efficiency): {rc['obj0_total']:+.4f}")
         print(f"    - Completed bonus: {rc['obj0_completed']:+.4f} (delta={rc['delta_completed']:.0f})")
-        print(f"    - Cancelled penalty: {rc['obj0_cancelled']:+.4f} (delta={rc['delta_cancelled']:.0f})")
-        print(f"    - Progress shaping: {rc['obj0_progress_shaping']:+.4f}")
+        print(f"    - Cancelled penalty: 0.0000 [disabled - Obj2 only]")
+        print(f"    - Progress shaping: 0.0000 [disabled]")
         print(f"  Obj1 (Cost): {rc['obj1_total']:+.4f}")
         print(f"    - Energy cost: {rc['obj1_energy_cost']:+.4f} (delta_energy={rc['delta_energy']:.2f})")
         print(f"    - Distance cost: {rc['obj1_distance_cost']:+.4f} (delta_distance={rc['delta_distance']:.2f})")
         print(f"  Obj2 (Service Quality): {rc['obj2_total']:+.4f}")
         print(f"    - On-time reward: {rc['obj2_on_time']:+.4f}")
-        print(f"    - Cancelled penalty: {rc['obj2_cancelled']:+.4f}")
-        print(f"    - Backlog penalty: {rc['obj2_backlog']:+.4f}")
+        print(f"    - Cancelled penalty: {rc['obj2_cancelled']:+.4f} (delta={rc['delta_cancelled']:.0f})")
+        print(f"    - Backlog penalty (log): {rc['obj2_backlog']:+.4f}")
         print("=" * 60)
 
     def _get_info(self):
