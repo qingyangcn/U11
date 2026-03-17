@@ -2045,7 +2045,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # dense shaping (no longer uses heading since we removed it)
         shaping_vec = self._calculate_shaping_reward(action)
         r_vec = r_vec + shaping_vec
-        self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
 
         # Update total reward components for diagnostics
         self.last_step_reward_components['obj0_total'] = float(r_vec[0])
@@ -2118,7 +2117,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.in_overtime = False
             self.overtime_steps = 0
 
-        # ---- 新增：累计 episode 向量回报（用最终 r_vec）----
+        # 累计 episode 向量回报（每步仅累计一次，含终止步的 final_bonus）
         self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
 
         # ---- 标量 reward 输出模式（路线1推荐用 "zero"）----
