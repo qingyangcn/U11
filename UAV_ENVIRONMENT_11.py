@@ -2345,6 +2345,38 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             for order_id in invalid_cargo:
                 cargo.discard(order_id)
 
+        # Invariant 3: Restore serving_order_id for FLYING_TO_CUSTOMER drones that lost
+        # their serving link (e.g. after a blocked IDLE transition cleared it prematurely).
+        # Only applies to FLYING_TO_CUSTOMER; other active statuses handle their own serving
+        # order via the task-selection or arrival logic.
+        for drone_id, drone in self.drones.items():
+            if drone['status'] != DroneStatus.FLYING_TO_CUSTOMER:
+                continue
+            if drone.get('serving_order_id') is not None:
+                # Validate the existing serving_order_id is still coherent
+                soid = drone['serving_order_id']
+                if (soid in self.orders and
+                        self.orders[soid]['status'] == OrderStatus.PICKED_UP and
+                        self.orders[soid].get('assigned_drone') == drone_id):
+                    continue  # Still valid; nothing to repair
+            # serving_order_id missing or stale — scan cargo for a PICKED_UP order
+            cargo = drone.get('cargo', set())
+            for oid in cargo:
+                if oid not in self.orders:
+                    continue
+                order = self.orders[oid]
+                if (order['status'] == OrderStatus.PICKED_UP and
+                        order.get('assigned_drone') == drone_id):
+                    customer_loc = order.get('customer_location')
+                    if customer_loc:
+                        drone['serving_order_id'] = oid
+                        # Re-aim at customer if target is stale
+                        if drone.get('target_location') != customer_loc:
+                            drone['target_location'] = customer_loc
+                        if self.debug_state_warnings:
+                            print(f"[Repair] 无人机 {drone_id} serving_order_id 恢复为 {oid}")
+                    break
+
         for order_id in list(self.active_orders):
             if order_id not in self.orders:
                 self.active_orders.discard(order_id)
@@ -2777,6 +2809,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
 
             order = self.orders[order_id]
+
+            # If the drone already has PICKED_UP cargo that must be delivered first,
+            # and PPO selected a *different* order (not one of those cargo items),
+            # skip the new assignment and restore the delivery chain if needed.
+            picked_up_in_cargo = [
+                oid for oid in drone.get('cargo', set())
+                if oid in self.orders and self.orders[oid]['status'] == OrderStatus.PICKED_UP
+            ]
+            if picked_up_in_cargo and order_id not in picked_up_in_cargo:
+                # Restore serving_order_id / FLYING_TO_CUSTOMER if currently broken
+                current_serving = drone.get('serving_order_id')
+                if current_serving not in picked_up_in_cargo:
+                    target_oid = picked_up_in_cargo[0]
+                    drone['serving_order_id'] = target_oid
+                    target_order = self.orders[target_oid]
+                    customer_loc = target_order.get('customer_location')
+                    if customer_loc:
+                        self.state_manager.update_drone_status(
+                            drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
+                        )
+                continue
 
             # Track state before changes to detect if action actually applied
             state_changed = False
@@ -3683,6 +3736,30 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
 
+    def _restore_next_delivery(self, drone_id: int, drone: dict) -> bool:
+        """After a blocked IDLE transition, restore delivery state for remaining PICKED_UP cargo.
+
+        Scans *drone['cargo']* for the first order that is still PICKED_UP and assigned
+        to this drone, then sets *serving_order_id* and transitions the drone to
+        FLYING_TO_CUSTOMER.  Returns True if a pending delivery was found and wired up,
+        False if the cargo is empty (or no valid PICKED_UP order remains).
+        """
+        cargo = drone.get('cargo', set())
+        for oid in cargo:
+            if oid not in self.orders:
+                continue
+            order = self.orders[oid]
+            if (order['status'] == OrderStatus.PICKED_UP and
+                    order.get('assigned_drone') == drone_id):
+                customer_loc = order.get('customer_location')
+                if customer_loc:
+                    drone['serving_order_id'] = oid
+                    self.state_manager.update_drone_status(
+                        drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
+                    )
+                    return True
+        return False
+
     def _handle_batch_pickup(self, drone_id, drone):
         if 'batch_orders' not in drone or not drone['batch_orders']:
             self._safe_reset_drone(drone_id, drone)
@@ -3809,17 +3886,26 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                                 drone['cargo'].discard(serving_order_id)
                                 self._reset_order_to_ready(serving_order_id,
                                                            "task_selection_no_customer_location")
-                                drone['serving_order_id'] = None
-                                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
-                                                                       target_location=None)
+                                # Atomically clear serving_order_id: only after IDLE succeeds;
+                                # if IDLE is blocked by other PICKED_UP cargo, restore delivery.
+                                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                                              target_location=None):
+                                    if not self._restore_next_delivery(drone_id, drone):
+                                        drone['serving_order_id'] = None
+                                else:
+                                    drone['serving_order_id'] = None
                             return
 
                 # If we couldn't perform pickup, release the ASSIGNED order back to READY
                 # so it can be re-assigned to another drone.
                 if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.ASSIGNED:
                     self._reset_order_to_ready(serving_order_id, "task_selection_pickup_failed")
-                drone['serving_order_id'] = None
-                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                # Atomically clear serving_order_id after IDLE transition.
+                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None):
+                    if not self._restore_next_delivery(drone_id, drone):
+                        drone['serving_order_id'] = None
+                else:
+                    drone['serving_order_id'] = None
 
             elif drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
                 # Arrived at customer - perform delivery
@@ -3835,9 +3921,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         if serving_order_id in drone['cargo']:
                             drone['cargo'].remove(serving_order_id)
 
-                        # Clear serving order and go idle (PPO will decide next action)
-                        drone['serving_order_id'] = None
-                        self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                        # Atomically clear serving_order_id: only after IDLE succeeds.
+                        # If IDLE is blocked (other PICKED_UP cargo), restore next delivery.
+                        if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                                      target_location=None):
+                            if not self._restore_next_delivery(drone_id, drone):
+                                drone['serving_order_id'] = None
+                        else:
+                            drone['serving_order_id'] = None
                         return
 
                 # If we couldn't deliver, release the PICKED_UP order back to READY
@@ -3845,8 +3936,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.PICKED_UP:
                     drone.get('cargo', set()).discard(serving_order_id)
                     self._reset_order_to_ready(serving_order_id, "task_selection_delivery_failed")
-                drone['serving_order_id'] = None
-                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                # Atomically clear serving_order_id after IDLE transition.
+                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None):
+                    if not self._restore_next_delivery(drone_id, drone):
+                        drone['serving_order_id'] = None
+                else:
+                    drone['serving_order_id'] = None
 
             return
 
@@ -3890,6 +3985,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP,
                                                                reason="arrived_merchant_pickup")
                         assigned_order['pickup_time'] = self.time_system.current_step
+                        drone['cargo'].add(oid)
 
                         self._start_new_task(drone_id, drone, assigned_order['customer_location'])
                         self.state_manager.update_drone_status(
