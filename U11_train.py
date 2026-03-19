@@ -388,7 +388,7 @@ def main():
                         help="Maximum orders in observation (default: 400)")
     parser.add_argument("--top-k-merchants", type=int, default=50,
                         help="Top K merchants (default: 100)")
-    parser.add_argument("--candidate-k", type=int, default=10,
+    parser.add_argument("--candidate-k", type=int, default=20,
                         help="Number of candidates per drone (default: 20)")
     parser.add_argument("--rule-count", type=int, default=5,
                         help="Number of rules for action space (default: 5)")
