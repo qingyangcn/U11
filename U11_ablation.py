@@ -45,7 +45,7 @@ except ImportError:
 
 def random_policy(local_obs: dict) -> int:
     """Simple random policy for testing."""
-    return np.random.randint(0, 5)
+    return 3
 
 
 def load_trained_policy(model_path: str, vecnormalize_path: str = None):
@@ -137,7 +137,7 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
         reward_output_mode="scalar",
         enable_random_events=args.enable_random_events,
         debug_state_warnings=False,
-        fixed_objective_weights=(0.5, 0.3, 0.2),
+        fixed_objective_weights=(0.3, 0.2, 0.5),
         num_candidates=args.candidate_k,
         rule_count=5,
         enable_diagnostics=False,
@@ -342,11 +342,11 @@ def main():
     # Environment parameters
     parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 10)")
-    parser.add_argument("--obs-max-orders", type=int, default=400,
+    parser.add_argument("--obs-max-orders", type=int, default=200,
                         help="Maximum orders in observation (default: 200)")
-    parser.add_argument("--top-k-merchants", type=int, default=100,
+    parser.add_argument("--top-k-merchants", type=int, default=50,
                         help="Top K merchants (default: 50)")
-    parser.add_argument("--candidate-k", type=int, default=20,
+    parser.add_argument("--candidate-k", type=int, default=10,
                         help="Number of candidates per drone (default: 20)")
     parser.add_argument("--enable-random-events", action="store_true", default=False,
                         help="Enable random events (default: False)")

@@ -76,9 +76,9 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
     if args.use_mopso and _HAS_MOPSO:
         candidate_generator = MOPSOCandidateGenerator(
             candidate_k=args.candidate_k,
-            n_particles=30,
-            n_iterations=10,
-            max_orders=200,
+            n_particles=10,
+            n_iterations=3,
+            max_orders=100,
             max_orders_per_drone=10,
             seed=seed,
         )
@@ -99,6 +99,7 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
     stats['seed'] = seed
     stats['rule_id'] = rule_id
     stats['policy'] = f'fixed_rule_{rule_id}'
+
     return stats
 
 
@@ -107,7 +108,7 @@ def main():
         description="Baseline: Fixed Rule Selection"
     )
 
-    parser.add_argument("--rule-id", type=int, default=2,
+    parser.add_argument("--rule-id", type=int, default=3,
                         help="Fixed rule ID in {0,1,2,3,4} (required unless --all-rules)")
     parser.add_argument("--all-rules", action="store_true", default=True,
                         help="Run all 5 fixed rules (0..4) sequentially")
@@ -118,11 +119,11 @@ def main():
                              "(overrides --seed when provided)")
     parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 20)")
-    parser.add_argument("--obs-max-orders", type=int, default=400,
+    parser.add_argument("--obs-max-orders", type=int, default=200,
                         help="Maximum orders in observation (default: 400)")
-    parser.add_argument("--top-k-merchants", type=int, default=100,
+    parser.add_argument("--top-k-merchants", type=int, default=50,
                         help="Top K merchants (default: 100)")
-    parser.add_argument("--candidate-k", type=int, default=20,
+    parser.add_argument("--candidate-k", type=int, default=10,
                         help="Number of candidates per drone ")
     parser.add_argument("--enable-random-events", action="store_true", default=False,
                         help="Enable random events (default: False)")
@@ -158,15 +159,11 @@ def main():
             all_stats.append(stats)
             rule_stats.append(stats)
 
+
         if len(rule_stats) > 1:
             gc_values = [s['general_completion'] for s in rule_stats]
-            sc_values = [s['serviceable_completion'] for s in rule_stats
-                         if not math.isnan(s['serviceable_completion'])]
             print(f"  [rule_id={rule_id} mean]  "
-                  f"mean_general_completion={float(np.mean(gc_values)):.4f}  "
-                  f"mean_serviceable_completion="
-                  f"{float(np.mean(sc_values)):.4f if sc_values else 'nan'}")
-
+                  f"mean_general_completion={float(np.mean(gc_values)):.4f}")
     print("=" * 80)
     return all_stats
 
