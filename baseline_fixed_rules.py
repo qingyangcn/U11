@@ -25,7 +25,6 @@ Usage:
 """
 
 import argparse
-import math
 import os
 import sys
 from typing import Callable
