@@ -255,9 +255,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_final.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_1550000_steps.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='vecnormalize_u11_final.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1550000_steps.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Other parameters

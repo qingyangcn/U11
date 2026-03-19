@@ -402,7 +402,7 @@ def main():
                         help="Battery threshold for return (default: 10.0)")
 
     # Diagnostics
-    parser.add_argument("--enable-diagnostics", action="store_true", default=False,
+    parser.add_argument("--enable-diagnostics", action="store_true", default=True,
                         help="Enable environment diagnostics (default: False)")
     parser.add_argument("--diagnostics-interval", type=int, default=64,
                         help="Diagnostics print interval (default: 64)")
@@ -424,7 +424,7 @@ def main():
                         help="PPO clip range (default: 0.1)")
 
     # Saving
-    parser.add_argument("--save-freq", type=int, default=10000,
+    parser.add_argument("--save-freq", type=int, default=50000,
                         help="Checkpoint save frequency (default: 10000)")
     parser.add_argument("--log-dir", type=str, default="./logs/u11",
                         help="TensorBoard log directory (default: ./logs/u11)")

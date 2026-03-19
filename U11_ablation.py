@@ -301,9 +301,9 @@ def run_sanity_check(args):
         print("Creating MOPSO candidate generator...")
         candidate_generator = MOPSOCandidateGenerator(
             candidate_k=args.candidate_k,
-            n_particles=30,
-            n_iterations=10,
-            max_orders=200,
+            n_particles=10,
+            n_iterations=3,
+            max_orders=100,
             max_orders_per_drone=10,
             seed=args.seed,
         )
@@ -358,9 +358,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_1010000_steps.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_1550000_steps.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1010000_steps.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1550000_steps.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Order cutoff parameter
