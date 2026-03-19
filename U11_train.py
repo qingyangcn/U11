@@ -95,6 +95,7 @@ def make_env(
         diagnostics_interval: int,
         training_mode: str = 'event_driven_shared_policy',
         drone_sampling: str = 'random',
+        train_round_mode: str = 'round_synchronous',
 ) -> gym.Env:
     """
     Create U11 environment with MOPSO candidate generation and event-driven wrapper.
@@ -121,6 +122,10 @@ def make_env(
         diagnostics_interval: Diagnostics print interval
         training_mode: Training mode ('event_driven_shared_policy' or 'central_queue')
         drone_sampling: Drone sampling strategy ('random' or 'round_robin')
+        train_round_mode: Round semantics for SingleUAVTrainingWrapper.
+            'round_synchronous' (default) aligns with decentralized execution:
+            all drones in a decision round decide before env.step() is called once.
+            'legacy_stepwise' restores old one-drone-then-step behaviour.
 
     Returns:
         Wrapped environment ready for training
@@ -177,6 +182,7 @@ def make_env(
             max_skip_steps=max_skip_steps,
             drone_sampling=drone_sampling,
             local_obs_only=False,
+            round_mode=train_round_mode,
         )
     elif training_mode == 'central_queue':
         # LEGACY MODE: Event-driven single UAV wrapper (centralized queue)
@@ -237,6 +243,7 @@ def train(args):
             diagnostics_interval=args.diagnostics_interval,
             training_mode=args.training_mode,
             drone_sampling=args.drone_sampling,
+            train_round_mode=args.train_round_mode,
         )
 
     # Create vectorized environment
@@ -263,6 +270,8 @@ def train(args):
     if args.training_mode == 'event_driven_shared_policy':
         print(f"  → Shared Policy for Decentralized Execution (CTDE)")
         print(f"  → Drone Sampling: {args.drone_sampling}")
+        print(f"  → Round Mode: {args.train_round_mode}  "
+              f"({'aligned with DecentralizedEventDrivenExecutor' if args.train_round_mode == 'round_synchronous' else 'legacy one-drone-then-step'})")
     print(f"Environment: UAV_ENVIRONMENT_11.ThreeObjectiveDroneDeliveryEnv")
     print(f"  num_drones={args.num_drones}, obs_max_orders={args.obs_max_orders}")
     print(f"  top_k_merchants={args.top_k_merchants}, candidate_k={args.candidate_k}")
@@ -360,6 +369,17 @@ def main():
                         default='random',
                         choices=['random', 'round_robin'],
                         help="Drone sampling strategy for training (default: random)")
+    parser.add_argument("--train-round-mode", type=str,
+                        default='round_synchronous',
+                        choices=['round_synchronous', 'legacy_stepwise'],
+                        help=(
+                            "Training round semantics for SingleUAVTrainingWrapper. "
+                            "'round_synchronous' (default): all drones in a decision round "
+                            "decide before env.step() is called once – matches "
+                            "DecentralizedEventDrivenExecutor. "
+                            "'legacy_stepwise': original one-drone-then-step behaviour "
+                            "(regression/comparison only)."
+                        ))
 
     # Environment parameters
     parser.add_argument("--num-drones", type=int, default=20,
@@ -368,7 +388,7 @@ def main():
                         help="Maximum orders in observation (default: 400)")
     parser.add_argument("--top-k-merchants", type=int, default=50,
                         help="Top K merchants (default: 100)")
-    parser.add_argument("--candidate-k", type=int, default=10,
+    parser.add_argument("--candidate-k", type=int, default=20,
                         help="Number of candidates per drone (default: 20)")
     parser.add_argument("--rule-count", type=int, default=5,
                         help="Number of rules for action space (default: 5)")

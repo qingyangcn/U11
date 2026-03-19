@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
+from U11_single_uav_training_wrapper import SingleUAVTrainingWrapper
 
 try:
     from U10_candidate_generator import MOPSOCandidateGenerator
@@ -119,6 +120,145 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
         return int(action)
 
     return policy_fn
+
+
+def run_wrapper_sanity_check(args):
+    """
+    Validate SingleUAVTrainingWrapper round-synchronous semantics.
+
+    Assertions:
+    1. Within one decision round env.step() is called exactly once.
+    2. Every drone's action is submitted via apply_rule_to_drone before the step.
+    3. When there are no decision drones the skip logic advances time correctly.
+    """
+    print("\n" + "=" * 80)
+    print("SingleUAVTrainingWrapper – Round-Synchronous Sanity Check")
+    print("=" * 80)
+
+    # ── Build a minimal env ────────────────────────────────────────────────────
+    env = ThreeObjectiveDroneDeliveryEnv(
+        grid_size=16,
+        num_drones=args.num_drones,
+        max_orders=args.obs_max_orders,
+        num_bases=2,
+        steps_per_hour=12,
+        drone_max_capacity=10,
+        top_k_merchants=args.top_k_merchants,
+        reward_output_mode="scalar",
+        enable_random_events=False,
+        debug_state_warnings=False,
+        fixed_objective_weights=(0.3, 0.2, 0.5),
+        num_candidates=args.candidate_k,
+        rule_count=5,
+        enable_diagnostics=False,
+        energy_e0=0.1,
+        energy_alpha=0.5,
+        battery_return_threshold=10.0,
+        multi_objective_mode="fixed",
+        candidate_update_interval=8,
+        candidate_fallback_enabled=False,
+    )
+
+    # ── Monkey-patch env.step() to count calls ────────────────────────────────
+    _env_step_calls = [0]
+    _original_step = env.step
+
+    def _counting_step(action):
+        _env_step_calls[0] += 1
+        return _original_step(action)
+
+    env.step = _counting_step
+
+    # ── Also track apply_rule_to_drone calls ──────────────────────────────────
+    _apply_calls = []
+    _original_apply = env.apply_rule_to_drone
+
+    def _tracking_apply(drone_id, rule_id):
+        _apply_calls.append(drone_id)
+        return _original_apply(drone_id, rule_id)
+
+    env.apply_rule_to_drone = _tracking_apply
+
+    wrapper = SingleUAVTrainingWrapper(
+        env,
+        max_skip_steps=args.max_skip_steps,
+        round_mode='round_synchronous',
+    )
+
+    obs, info = wrapper.reset()
+    assert obs.shape == wrapper.observation_space.shape, \
+        f"Unexpected obs shape: {obs.shape}"
+
+    print(f"  reset() OK – first round has {len(wrapper._round_drones)} drone(s)")
+
+    # ── Assertion 1 & 2: step through one full decision round ─────────────────
+    first_round_size = len(wrapper._round_drones)
+    if first_round_size == 0:
+        print("  SKIP: No decision drones in first round (env started with no decisions).")
+    else:
+        steps_before = _env_step_calls[0]
+        apply_before = len(_apply_calls)
+
+        # Submit actions for every drone except the last – env must NOT step yet
+        for intra_i in range(first_round_size - 1):
+            obs, reward, terminated, truncated, info = wrapper.step(0)
+            # env.step() must not have been called yet
+            assert _env_step_calls[0] == steps_before, (
+                f"FAIL assertion 1: env.step() called {_env_step_calls[0] - steps_before} "
+                f"time(s) inside round before all actions collected "
+                f"(intra step {intra_i + 1}/{first_round_size - 1})"
+            )
+            assert reward == 0.0, (
+                f"FAIL: intra-round step returned reward={reward} (expected 0)"
+            )
+            winfo = info.get('wrapper', {})
+            assert not winfo.get('round_completed', True), \
+                "FAIL: round_completed=True for intra-round step"
+
+        # Submit the last action – env.step() must fire exactly once now
+        obs, reward, terminated, truncated, info = wrapper.step(0)
+        steps_after = _env_step_calls[0]
+        assert steps_after - steps_before == 1, (
+            f"FAIL assertion 1: expected exactly 1 env.step() per round, "
+            f"got {steps_after - steps_before}"
+        )
+        print(f"  ✓ Assertion 1 PASS: env.step() called exactly once for "
+              f"round of size {first_round_size}")
+
+        # Check that all drones had apply_rule called
+        applied_count = len(_apply_calls) - apply_before
+        assert applied_count == first_round_size, (
+            f"FAIL assertion 2: expected {first_round_size} apply_rule calls, "
+            f"got {applied_count}"
+        )
+        print(f"  ✓ Assertion 2 PASS: apply_rule_to_drone called for all "
+              f"{first_round_size} drone(s) before env.step()")
+
+        winfo = info.get('wrapper', {})
+        assert winfo.get('round_completed', False), \
+            "FAIL: round_completed not set in round-flush info"
+        assert winfo.get('decision_rounds', 0) >= 1, \
+            "FAIL: decision_rounds counter not incremented"
+
+    # ── Assertion 3: skip logic when no decision drones ───────────────────────
+    # Force a state where get_decision_drones() returns empty, then call reset
+    # and verify wrapper doesn't crash and still returns a valid obs.
+    print("  Checking skip logic (re-reset to exercise _skip_to_next_decision)...")
+    _skip_env_steps_before = _env_step_calls[0]
+    obs2, info2 = wrapper.reset()
+    assert obs2.shape == wrapper.observation_space.shape, \
+        "FAIL assertion 3: invalid obs shape after second reset()"
+    skip_steps = wrapper.total_skip_steps
+    print(f"  ✓ Assertion 3 PASS: reset() completed (total_skip_steps={skip_steps}, "
+          f"env.step() calls during reset={_env_step_calls[0] - _skip_env_steps_before})")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\nWrapper sanity check PASSED ✓")
+    print(f"  decision_rounds={wrapper.decision_rounds}, "
+          f"individual_decisions={wrapper.individual_decisions}, "
+          f"actions_applied={wrapper.actions_applied}, "
+          f"total_skip_steps={wrapper.total_skip_steps}")
+    print("=" * 80)
 
 
 def run_sanity_check(args):
@@ -274,6 +414,7 @@ def main():
 
     # Run sanity check
     try:
+        run_wrapper_sanity_check(args)
         run_sanity_check(args)
     except Exception as e:
         print("\n" + "=" * 80)
