@@ -1466,6 +1466,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Bounded deques to prevent unbounded growth of sample lists
             'assignment_slack_samples': deque(maxlen=2000),
             'ready_based_lateness_samples': deque(maxlen=2000),
+            # Steps from order READY to first assignment (for latency reporting)
+            'wait_ready_to_assigned_samples': deque(maxlen=2000),
         }
 
         # 事件/历史 - 使用有界 deque 防止长训练时内存无限增长
@@ -3154,6 +3156,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
             self.metrics['assignment_slack_samples'].append(assignment_slack)
+            # Record wait time from READY to assignment
+            _rdy = o.get('ready_step')
+            if _rdy is not None:
+                self.metrics['wait_ready_to_assigned_samples'].append(
+                    self.time_system.current_step - _rdy)
 
         if not committed:
             return False
@@ -3257,6 +3264,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
             self.metrics['assignment_slack_samples'].append(assignment_slack)
+            # Record wait time from READY to assignment
+            _rdy = o.get('ready_step')
+            if _rdy is not None:
+                self.metrics['wait_ready_to_assigned_samples'].append(
+                    self.time_system.current_step - _rdy)
 
         if not committed:
             return False
@@ -3379,6 +3391,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         deadline_step = self._get_delivery_deadline_step(order)
         assignment_slack = deadline_step - self.time_system.current_step
         self.metrics['assignment_slack_samples'].append(assignment_slack)
+        # Record wait time from READY to assignment
+        _rdy = order.get('ready_step')
+        if _rdy is not None:
+            self.metrics['wait_ready_to_assigned_samples'].append(
+                self.time_system.current_step - _rdy)
 
         target_merchant_loc = order['merchant_location']
 

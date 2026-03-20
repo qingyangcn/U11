@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import os
 import sys
 from typing import Callable
@@ -99,9 +100,9 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps)
+    executor.run_episode(max_steps=args.max_steps, seed=seed)
 
-    stats = _compute_completion_stats(env)
+    stats = _compute_completion_stats(env, executor)
     stats['seed'] = seed
     stats['rule_id'] = rule_id
     stats['policy'] = f'fixed_rule_{rule_id}'
@@ -163,6 +164,15 @@ def main():
     # rule_id -> list of per-seed stats
     rule_summary: dict = {}
 
+    # Extended aggregate keys (completion + new unified metrics)
+    _AGG_KEYS = [
+        ('general_completion',          'GC'),
+        ('cumulative_reward',           'reward'),
+        ('energy_per_completed',        'energy_pc'),
+        ('avg_wait_ready_to_assigned',  'wait_avg'),
+        ('p95_wait_ready_to_assigned',  'wait_p95'),
+    ]
+
     for rule_id in rule_ids:
         rule_stats = []
         print(f"\n[rule_id={rule_id}]")
@@ -171,39 +181,62 @@ def main():
             all_stats.append(stats)
             rule_stats.append(stats)
             print(f"  seed={seed:>6}  GC={stats['general_completion']:.4f}  "
+                  f"reward={stats['cumulative_reward']:.2f}  "
+                  f"energy_pc={stats['energy_per_completed']:.3f}  "
+                  f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}  "
                   f"generated={stats['generated_total']}  "
                   f"completed={stats['completed_total']}")
 
-        gc_values = [s['general_completion'] for s in rule_stats]
-        if len(gc_values) > 1:
-            print(f"  ── aggregate (n={len(gc_values)}) ──")
-            print(f"     mean={float(np.mean(gc_values)):.4f}  "
-                  f"std={float(np.std(gc_values)):.4f}  "
-                  f"min={float(np.min(gc_values)):.4f}  "
-                  f"max={float(np.max(gc_values)):.4f}")
-        rule_summary[rule_id] = gc_values
+        if len(rule_stats) > 1:
+            print(f"  ── aggregate (n={len(rule_stats)}) ──")
+            for key, label in _AGG_KEYS:
+                vals = [s[key] for s in rule_stats
+                        if not (isinstance(s[key], float) and math.isnan(s[key]))]
+                if vals:
+                    print(f"     {label:<12}  "
+                          f"mean={float(np.mean(vals)):.4f}  "
+                          f"std={float(np.std(vals)):.4f}  "
+                          f"min={float(np.min(vals)):.4f}  "
+                          f"max={float(np.max(vals)):.4f}")
+
+        rule_summary[rule_id] = rule_stats
 
     # Overall comparison table
     if len(rule_ids) > 1:
         print("\n" + "=" * 80)
         print(f"Overall Comparison  (n_seeds={len(seeds)})")
-        print(f"  {'rule_id':>7}  {'mean_GC':>9}  {'std_GC':>8}  "
-              f"{'min_GC':>8}  {'max_GC':>8}")
-        for rule_id in rule_ids:
-            gc = rule_summary[rule_id]
-            print(f"  {rule_id:>7}  {float(np.mean(gc)):>9.4f}  "
-                  f"{float(np.std(gc)):>8.4f}  "
-                  f"{float(np.min(gc)):>8.4f}  "
-                  f"{float(np.max(gc)):>8.4f}")
-        # Highlight best rule by mean GC
-        best_rule = max(rule_ids, key=lambda r: float(np.mean(rule_summary[r])))
-        print(f"\n  Best rule by mean_GC: rule_id={best_rule}  "
-              f"mean_GC={float(np.mean(rule_summary[best_rule])):.4f}")
+        for key, label in _AGG_KEYS:
+            print(f"\n  {label}")
+            print(f"  {'rule_id':>7}  {'mean':>10}  {'std':>8}  {'min':>8}  {'max':>8}")
+            rule_means = {}
+            for rule_id in rule_ids:
+                vals = [s[key] for s in rule_summary[rule_id]
+                        if not (isinstance(s[key], float) and math.isnan(s[key]))]
+                if vals:
+                    m = float(np.mean(vals))
+                    rule_means[rule_id] = m
+                    print(f"  {rule_id:>7}  {m:>10.4f}  "
+                          f"{float(np.std(vals)):>8.4f}  "
+                          f"{float(np.min(vals)):>8.4f}  "
+                          f"{float(np.max(vals)):>8.4f}")
+                else:
+                    rule_means[rule_id] = float('nan')
+                    print(f"  {rule_id:>7}  {'nan':>10}  {'nan':>8}  {'nan':>8}  {'nan':>8}")
+            if key == 'general_completion' and rule_means:
+                valid = {r: v for r, v in rule_means.items() if not math.isnan(v)}
+                if valid:
+                    best_rule = max(valid, key=lambda r: valid[r])
+                    print(f"\n  Best rule by mean_GC: rule_id={best_rule}  "
+                          f"mean_GC={valid[best_rule]:.4f}")
 
     # CSV output
     if args.csv_out:
-        fieldnames = ['rule_id', 'policy', 'seed',
-                      'generated_total', 'completed_total', 'general_completion']
+        fieldnames = [
+            'rule_id', 'policy', 'seed',
+            'generated_total', 'completed_total', 'general_completion',
+            'cumulative_reward', 'energy_total', 'energy_per_completed',
+            'avg_wait_ready_to_assigned', 'p95_wait_ready_to_assigned',
+        ]
         with open(args.csv_out, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
