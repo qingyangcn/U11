@@ -13,6 +13,12 @@ Usage:
     # Test with trained policy
     python U11_ablation.py --model-path ./models/u10/ppo_u10_final.zip
 
+    # Multi-seed evaluation (random policy, 3 seeds)
+    python U11_ablation.py --seeds 21,42,43
+
+    # Multi-seed evaluation with trained policy
+    python U11_ablation.py --model-path ppo_u11.zip --seeds 21,42,43 --csv-out results.csv
+
     # Quick test (fewer steps)
     python U11_ablation.py --max-steps 100
 
@@ -181,15 +187,18 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
     env = _make_env(args, order_cutoff_steps=order_cutoff_steps)
 
     if _HAS_MOPSO:
-        candidate_generator = MOPSOCandidateGenerator(
-            candidate_k=args.candidate_k,
-            n_particles=30,
-            n_iterations=10,
-            max_orders=200,
-            max_orders_per_drone=10,
-            seed=seed,
-        )
-        env.set_candidate_generator(candidate_generator)
+        try:
+            candidate_generator = MOPSOCandidateGenerator(
+                candidate_k=args.candidate_k,
+                n_particles=30,
+                n_iterations=10,
+                max_orders=200,
+                max_orders_per_drone=10,
+                seed=seed,
+            )
+            env.set_candidate_generator(candidate_generator)
+        except (ImportError, Exception):
+            pass  # Fall back to built-in candidates when MOPSO unavailable
 
     policy_fn = random_policy
 
@@ -218,6 +227,105 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
               f"n_empty_candidates={action_stats.n_empty_candidates}")
 
     return stats
+
+
+def run_multi_seed_eval(args):
+    """Run multi-seed evaluation and aggregate completion statistics.
+
+    Loads the policy once (trained model if ``--model-path`` exists, otherwise
+    the built-in random policy) then runs one episode per seed, printing
+    per-seed results and a final aggregate summary.
+
+    Args:
+        args: Parsed CLI arguments.  Uses ``args.seeds``, ``args.model_path``,
+              ``args.vecnormalize_path``, ``args.order_cutoff_steps``,
+              ``args.max_steps``, ``args.max_skip_steps``, ``args.csv_out``.
+    """
+    seeds = [int(s.strip()) for s in args.seeds.split(',')]
+
+    # Load policy once, shared across all seeds
+    if args.model_path and os.path.exists(args.model_path):
+        policy_fn = load_trained_policy(args.model_path, args.vecnormalize_path)
+        policy_name = f"Trained ({os.path.basename(args.model_path)})"
+    else:
+        policy_fn = random_policy
+        policy_name = "Random (rule_id=3)"
+
+    print("=" * 80)
+    print("Multi-Seed Evaluation")
+    print(f"  Policy:            {policy_name}")
+    print(f"  Seeds ({len(seeds)}):        {seeds}")
+    print(f"  order_cutoff_steps: {args.order_cutoff_steps}")
+    print(f"  max_steps:          {args.max_steps}")
+    print("=" * 80)
+
+    rows = []
+    fieldnames = ['seed', 'generated_total', 'completed_total', 'general_completion']
+
+    for seed in seeds:
+        print(f"  seed={seed:>6} ...", end=' ', flush=True)
+
+        env = _make_env(args, order_cutoff_steps=args.order_cutoff_steps)
+
+        if _HAS_MOPSO:
+            try:
+                candidate_generator = MOPSOCandidateGenerator(
+                    candidate_k=args.candidate_k,
+                    n_particles=10,
+                    n_iterations=3,
+                    max_orders=100,
+                    max_orders_per_drone=10,
+                    seed=seed,
+                )
+                env.set_candidate_generator(candidate_generator)
+            except (ImportError, Exception):
+                pass  # Fall back to built-in candidates when MOPSO unavailable
+
+        executor = DecentralizedEventDrivenExecutor(
+            env=env,
+            policy_fn=policy_fn,
+            max_skip_steps=args.max_skip_steps,
+            verbose=False,
+            track_action_stats=getattr(args, 'track_action_stats', False),
+        )
+        executor.run_episode(max_steps=args.max_steps, seed=seed)
+
+        stats = _compute_completion_stats(env)
+        stats['seed'] = seed
+        rows.append(stats)
+
+        print(f"GC={stats['general_completion']:.4f}  "
+              f"generated={stats['generated_total']}  "
+              f"completed={stats['completed_total']}")
+
+        if getattr(args, 'track_action_stats', False):
+            action_stats = executor.get_action_stats()
+            pct = {k: f'{v:.1f}%' for k, v in action_stats.to_percent().items()}
+            print(f"    rule_counts={dict(action_stats.rule_counts)}  "
+                  f"rule_pct={pct}  "
+                  f"n_decisions={action_stats.n_decisions}  "
+                  f"n_empty={action_stats.n_empty_candidates}")
+
+    # Aggregate
+    gc_values = [r['general_completion'] for r in rows]
+    print("\n" + "=" * 80)
+    print(f"Multi-Seed Summary  policy={policy_name}  n={len(seeds)}")
+    print(f"  {'metric':<20}  {'value':>10}")
+    print(f"  {'mean_GC':<20}  {float(np.mean(gc_values)):>10.4f}")
+    print(f"  {'std_GC':<20}  {float(np.std(gc_values)):>10.4f}")
+    print(f"  {'min_GC':<20}  {float(np.min(gc_values)):>10.4f}")
+    print(f"  {'max_GC':<20}  {float(np.max(gc_values)):>10.4f}")
+
+    if args.csv_out:
+        with open(args.csv_out, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row[k] for k in fieldnames})
+        print(f"\nCSV written to: {args.csv_out}")
+
+    print("=" * 80)
+    return rows
 
 
 def run_ablation_cutoff(args):
@@ -299,15 +407,18 @@ def run_sanity_check(args):
     # Create MOPSO candidate generator
     if _HAS_MOPSO:
         print("Creating MOPSO candidate generator...")
-        candidate_generator = MOPSOCandidateGenerator(
-            candidate_k=args.candidate_k,
-            n_particles=10,
-            n_iterations=3,
-            max_orders=100,
-            max_orders_per_drone=10,
-            seed=args.seed,
-        )
-        env.set_candidate_generator(candidate_generator)
+        try:
+            candidate_generator = MOPSOCandidateGenerator(
+                candidate_k=args.candidate_k,
+                n_particles=10,
+                n_iterations=3,
+                max_orders=100,
+                max_orders_per_drone=10,
+                seed=args.seed,
+            )
+            env.set_candidate_generator(candidate_generator)
+        except (ImportError, Exception) as _mopso_err:
+            print(f"  Warning: MOPSO unavailable, using built-in candidates.")
 
     # Choose policy
     if args.model_path:
@@ -358,9 +469,9 @@ def main():
                         help="Maximum decision steps per episode (default: 500)")
 
     # Policy parameters
-    parser.add_argument("--model-path", type=str, default='ppo_u11_1550000_steps.zip',
+    parser.add_argument("--model-path", type=str, default='ppo_u11_final.zip',
                         help="Path to trained model (.zip file) - if not provided, uses random policy")
-    parser.add_argument("--vecnormalize-path", type=str, default='ppo_u11_vecnormalize_1550000_steps.pkl',
+    parser.add_argument("--vecnormalize-path", type=str, default='vecnormalize_u11_final.pkl',
                         help="Path to VecNormalize stats (.pkl file)")
 
     # Order cutoff parameter
@@ -374,14 +485,17 @@ def main():
     parser.add_argument("--cutoff-values", type=str, default="0",
                         help="Comma-separated environment order_cutoff_steps (K) values to sweep "
                              "in ablation mode (default: 0..60)")
-    parser.add_argument("--seeds", type=str, default="21",
-                        help="Comma-separated seed list for ablation mode (default: 42)")
     parser.add_argument("--csv-out", type=str, default=None,
-                        help="Output CSV path for ablation results")
+                        help="Output CSV path for multi-seed or ablation results")
 
     # Other parameters
     parser.add_argument("--seed", type=int, default=21,
-                        help="Random seed (default: 42)")
+                        help="Random seed for single-episode mode (default: 21); "
+                             "overridden when --seeds contains multiple values")
+    parser.add_argument("--seeds", type=str, default='21,22,23,35,81,105,135,688,918,515',
+                        help="Comma-separated seed list.  When provided in non-ablation mode "
+                             "the script runs one episode per seed and prints aggregate stats.  "
+                             "In ablation mode seeds are used for the K-sweep.")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Print detailed execution logs (default: False)")
     parser.add_argument("--track-action-stats", action="store_true", default=True,
@@ -389,6 +503,10 @@ def main():
                              "(default: False)")
 
     args = parser.parse_args()
+
+    # Resolve seeds: --seeds overrides --seed; default to single value of --seed
+    if args.seeds is None:
+        args.seeds = str(args.seed)
 
     if args.ablation_cutoff:
         try:
@@ -402,12 +520,16 @@ def main():
             traceback.print_exc()
             sys.exit(1)
     else:
-        # Run sanity check
+        # Multi-seed mode when multiple seeds are given; single-episode otherwise
+        seeds = [int(s.strip()) for s in args.seeds.split(',')]
+        run_fn = run_multi_seed_eval if len(seeds) > 1 else run_sanity_check
+        if len(seeds) == 1:
+            args.seed = seeds[0]  # keep args.seed in sync for run_sanity_check
         try:
-            run_sanity_check(args)
+            run_fn(args)
         except Exception as e:
             print("\n" + "=" * 80)
-            print("Sanity Check FAILED ✗")
+            print(f"{'Multi-Seed Eval' if len(seeds) > 1 else 'Sanity Check'} FAILED ✗")
             print("=" * 80)
             print(f"\nError: {e}")
             import traceback
