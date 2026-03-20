@@ -206,6 +206,7 @@ class SingleUAVTrainingWrapper(gym.Wrapper):
             truncated: Whether episode truncated
             info: Info dictionary with round metadata in info['wrapper']
         """
+
         if self.round_mode == 'round_synchronous':
             return self._step_round_synchronous(action)
         else:

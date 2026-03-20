@@ -99,7 +99,7 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps)
+    executor.run_episode(max_steps=args.max_steps, seed=seed)
 
     stats = _compute_completion_stats(env)
     stats['seed'] = seed
