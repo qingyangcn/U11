@@ -15,17 +15,20 @@ Rule descriptions (from UAV_ENVIRONMENT_11):
 
 Usage:
     # Run with fixed rule 3
-    python baseline_fixed_rule.py --rule-id 3 --seed 42
+    python baseline_fixed_rules.py --rule-id 3 --seed 42
 
     # Run all 5 fixed rules across multiple seeds
-    python baseline_fixed_rule.py --all-rules --seeds 42,43,44
+    python baseline_fixed_rules.py --all-rules --seeds 42,43,44
+
+    # Run all 5 fixed rules across multiple seeds and write CSV
+    python baseline_fixed_rules.py --all-rules --seeds 42,43,44 --csv-out results.csv
 
     # Run without MOPSO
-    python baseline_fixed_rule.py --rule-id 0 --seed 42 --no-mopso
+    python baseline_fixed_rules.py --rule-id 0 --seed 42 --no-mopso
 """
 
 import argparse
-import math
+import csv
 import os
 import sys
 from typing import Callable
@@ -74,15 +77,18 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
     env = _make_env(args, order_cutoff_steps=0)
 
     if args.use_mopso and _HAS_MOPSO:
-        candidate_generator = MOPSOCandidateGenerator(
-            candidate_k=args.candidate_k,
-            n_particles=10,
-            n_iterations=3,
-            max_orders=100,
-            max_orders_per_drone=10,
-            seed=seed,
-        )
-        env.set_candidate_generator(candidate_generator)
+        try:
+            candidate_generator = MOPSOCandidateGenerator(
+                candidate_k=args.candidate_k,
+                n_particles=10,
+                n_iterations=3,
+                max_orders=100,
+                max_orders_per_drone=10,
+                seed=seed,
+            )
+            env.set_candidate_generator(candidate_generator)
+        except (ImportError, Exception):
+            pass  # Fall back to built-in candidates when MOPSO unavailable
 
     fixed_policy = make_fixed_rule_policy(rule_id)
 
@@ -113,18 +119,18 @@ def main():
     parser.add_argument("--all-rules", action="store_true", default=True,
                         help="Run all 5 fixed rules (0..4) sequentially")
     parser.add_argument("--seed", type=int, default=21,
-                        help="Random seed for a single episode run (default: 42)")
+                        help="Random seed for a single episode run (default: 21)")
     parser.add_argument("--seeds", type=str, default='21',
                         help="Comma-separated seeds to run multiple episodes "
                              "(overrides --seed when provided)")
     parser.add_argument("--num-drones", type=int, default=20,
                         help="Number of drones (default: 20)")
     parser.add_argument("--obs-max-orders", type=int, default=200,
-                        help="Maximum orders in observation (default: 400)")
+                        help="Maximum orders in observation (default: 200)")
     parser.add_argument("--top-k-merchants", type=int, default=50,
-                        help="Top K merchants (default: 100)")
+                        help="Top K merchants (default: 50)")
     parser.add_argument("--candidate-k", type=int, default=10,
-                        help="Number of candidates per drone ")
+                        help="Number of candidates per drone")
     parser.add_argument("--enable-random-events", action="store_true", default=False,
                         help="Enable random events (default: False)")
     parser.add_argument("--max-skip-steps", type=int, default=1,
@@ -135,6 +141,8 @@ def main():
                         help="Use MOPSO candidate generator (default: True)")
     parser.add_argument("--no-mopso", dest="use_mopso", action="store_false",
                         help="Disable MOPSO candidate generator")
+    parser.add_argument("--csv-out", type=str, default=None,
+                        help="Write per-episode results to this CSV file")
 
     args = parser.parse_args()
 
@@ -147,23 +155,62 @@ def main():
 
     print("=" * 80)
     print("Baseline: Fixed Rule Selection")
-    print(f"  rule_ids={rule_ids}  seeds={seeds}  candidate_k={args.candidate_k}  "
-          f"use_mopso={args.use_mopso and _HAS_MOPSO}")
+    print(f"  rule_ids={rule_ids}  seeds={seeds}  n_seeds={len(seeds)}")
+    print(f"  candidate_k={args.candidate_k}  use_mopso={args.use_mopso and _HAS_MOPSO}")
     print("=" * 80)
 
     all_stats = []
+    # rule_id -> list of per-seed stats
+    rule_summary: dict = {}
+
     for rule_id in rule_ids:
         rule_stats = []
+        print(f"\n[rule_id={rule_id}]")
         for seed in seeds:
             stats = run_episode(args, rule_id=rule_id, seed=seed)
             all_stats.append(stats)
             rule_stats.append(stats)
+            print(f"  seed={seed:>6}  GC={stats['general_completion']:.4f}  "
+                  f"generated={stats['generated_total']}  "
+                  f"completed={stats['completed_total']}")
 
+        gc_values = [s['general_completion'] for s in rule_stats]
+        if len(gc_values) > 1:
+            print(f"  ── aggregate (n={len(gc_values)}) ──")
+            print(f"     mean={float(np.mean(gc_values)):.4f}  "
+                  f"std={float(np.std(gc_values)):.4f}  "
+                  f"min={float(np.min(gc_values)):.4f}  "
+                  f"max={float(np.max(gc_values)):.4f}")
+        rule_summary[rule_id] = gc_values
 
-        if len(rule_stats) > 1:
-            gc_values = [s['general_completion'] for s in rule_stats]
-            print(f"  [rule_id={rule_id} mean]  "
-                  f"mean_general_completion={float(np.mean(gc_values)):.4f}")
+    # Overall comparison table
+    if len(rule_ids) > 1:
+        print("\n" + "=" * 80)
+        print(f"Overall Comparison  (n_seeds={len(seeds)})")
+        print(f"  {'rule_id':>7}  {'mean_GC':>9}  {'std_GC':>8}  "
+              f"{'min_GC':>8}  {'max_GC':>8}")
+        for rule_id in rule_ids:
+            gc = rule_summary[rule_id]
+            print(f"  {rule_id:>7}  {float(np.mean(gc)):>9.4f}  "
+                  f"{float(np.std(gc)):>8.4f}  "
+                  f"{float(np.min(gc)):>8.4f}  "
+                  f"{float(np.max(gc)):>8.4f}")
+        # Highlight best rule by mean GC
+        best_rule = max(rule_ids, key=lambda r: float(np.mean(rule_summary[r])))
+        print(f"\n  Best rule by mean_GC: rule_id={best_rule}  "
+              f"mean_GC={float(np.mean(rule_summary[best_rule])):.4f}")
+
+    # CSV output
+    if args.csv_out:
+        fieldnames = ['rule_id', 'policy', 'seed',
+                      'generated_total', 'completed_total', 'general_completion']
+        with open(args.csv_out, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in all_stats:
+                writer.writerow({k: row[k] for k in fieldnames})
+        print(f"\nCSV written to: {args.csv_out}")
+
     print("=" * 80)
     return all_stats
 
