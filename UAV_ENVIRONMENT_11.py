@@ -1187,7 +1187,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array', 'matplotlib']}
 
     def __init__(self,
-                 grid_size=16,
+                 grid_size=50,
                  num_drones=6,
                  max_orders=100,
                  steps_per_hour=4,
@@ -1198,7 +1198,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=2.2,
+                 high_load_factor=2.0,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
@@ -1466,6 +1466,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Bounded deques to prevent unbounded growth of sample lists
             'assignment_slack_samples': deque(maxlen=2000),
             'ready_based_lateness_samples': deque(maxlen=2000),
+            # Steps from order READY to first assignment (for latency reporting)
+            'wait_ready_to_assigned_samples': deque(maxlen=2000),
         }
 
         # 事件/历史 - 使用有界 deque 防止长训练时内存无限增长
@@ -2181,7 +2183,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'status': DroneStatus.IDLE,
                 'current_order': None,
                 'orders_completed': 0,
-                'speed': self.np_random.uniform(3.0, 5.0),
+                'speed': 3,
                 'reliability': self.np_random.uniform(0.95, 0.99),
                 'max_capacity': self.drone_max_capacity,
                 'current_load': 0,
@@ -3154,6 +3156,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
             self.metrics['assignment_slack_samples'].append(assignment_slack)
+            # Record wait time from READY to assignment
+            _rdy = o.get('ready_step')
+            if _rdy is not None:
+                self.metrics['wait_ready_to_assigned_samples'].append(
+                    self.time_system.current_step - _rdy)
 
         if not committed:
             return False
@@ -3257,6 +3264,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             deadline_step = self._get_delivery_deadline_step(o)
             assignment_slack = deadline_step - self.time_system.current_step
             self.metrics['assignment_slack_samples'].append(assignment_slack)
+            # Record wait time from READY to assignment
+            _rdy = o.get('ready_step')
+            if _rdy is not None:
+                self.metrics['wait_ready_to_assigned_samples'].append(
+                    self.time_system.current_step - _rdy)
 
         if not committed:
             return False
@@ -3379,6 +3391,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         deadline_step = self._get_delivery_deadline_step(order)
         assignment_slack = deadline_step - self.time_system.current_step
         self.metrics['assignment_slack_samples'].append(assignment_slack)
+        # Record wait time from READY to assignment
+        _rdy = order.get('ready_step')
+        if _rdy is not None:
+            self.metrics['wait_ready_to_assigned_samples'].append(
+                self.time_system.current_step - _rdy)
 
         target_merchant_loc = order['merchant_location']
 

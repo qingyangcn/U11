@@ -157,23 +157,54 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
     )
 
 
-def _compute_completion_stats(env: ThreeObjectiveDroneDeliveryEnv) -> dict:
-    """Compute general completion statistics from a finished episode.
+def _compute_completion_stats(
+        env: ThreeObjectiveDroneDeliveryEnv,
+        executor=None,
+) -> dict:
+    """Compute unified evaluation metrics from a finished episode.
 
     Args:
         env: The finished environment.
+        executor: Optional ``DecentralizedEventDrivenExecutor`` to read
+                  ``cumulative_reward`` from.
 
     Returns:
-        Dict with keys: generated_total, completed_total, general_completion.
+        Dict with keys:
+            generated_total, completed_total, general_completion,
+            cumulative_reward, energy_total, energy_per_completed,
+            avg_wait_ready_to_assigned, p95_wait_ready_to_assigned.
     """
     generated_total = env.daily_stats['orders_generated']
     completed_total = env.daily_stats['orders_completed']
     general_completion = completed_total / generated_total if generated_total > 0 else 0.0
 
+    # cumulative_reward
+    cumulative_reward = float(executor.cumulative_reward) if executor is not None else float('nan')
+
+    # energy metrics
+    energy_total = float(env.daily_stats.get('energy_consumed', 0.0))
+    energy_per_completed = (
+        energy_total / completed_total if completed_total > 0 else float('nan')
+    )
+
+    # wait-ready-to-assigned
+    wait_samples = list(env.metrics.get('wait_ready_to_assigned_samples', []))
+    if wait_samples:
+        avg_wait = float(np.mean(wait_samples))
+        p95_wait = float(np.percentile(wait_samples, 95))
+    else:
+        avg_wait = float('nan')
+        p95_wait = float('nan')
+
     return {
         'generated_total': generated_total,
         'completed_total': completed_total,
         'general_completion': general_completion,
+        'cumulative_reward': cumulative_reward,
+        'energy_total': energy_total,
+        'energy_per_completed': energy_per_completed,
+        'avg_wait_ready_to_assigned': avg_wait,
+        'p95_wait_ready_to_assigned': p95_wait,
     }
 
 
@@ -212,7 +243,7 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
 
     executor.run_episode(max_steps=args.max_steps, seed=seed)
 
-    stats = _compute_completion_stats(env)
+    stats = _compute_completion_stats(env, executor)
     stats['order_cutoff_steps'] = order_cutoff_steps
     stats['seed'] = seed
 
@@ -260,7 +291,11 @@ def run_multi_seed_eval(args):
     print("=" * 80)
 
     rows = []
-    fieldnames = ['seed', 'generated_total', 'completed_total', 'general_completion']
+    fieldnames = [
+        'seed', 'generated_total', 'completed_total', 'general_completion',
+        'cumulative_reward', 'energy_total', 'energy_per_completed',
+        'avg_wait_ready_to_assigned', 'p95_wait_ready_to_assigned',
+    ]
 
     for seed in seeds:
         print(f"  seed={seed:>6} ...", end=' ', flush=True)
@@ -290,11 +325,15 @@ def run_multi_seed_eval(args):
         )
         executor.run_episode(max_steps=args.max_steps, seed=seed)
 
-        stats = _compute_completion_stats(env)
+        stats = _compute_completion_stats(env, executor)
         stats['seed'] = seed
         rows.append(stats)
 
         print(f"GC={stats['general_completion']:.4f}  "
+              f"reward={stats['cumulative_reward']:.2f}  "
+              f"energy_total={stats['energy_total']:2f}"
+              f"energy_pc={stats['energy_per_completed']:.3f}  "
+              f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}  "
               f"generated={stats['generated_total']}  "
               f"completed={stats['completed_total']}")
 
@@ -306,15 +345,28 @@ def run_multi_seed_eval(args):
                   f"n_decisions={action_stats.n_decisions}  "
                   f"n_empty={action_stats.n_empty_candidates}")
 
-    # Aggregate
-    gc_values = [r['general_completion'] for r in rows]
+    # Aggregate helpers
+    def _agg(key):
+        vals = [r[key] for r in rows if not math.isnan(r[key])]
+        if not vals:
+            return dict(mean=float('nan'), std=float('nan'),
+                        min=float('nan'), max=float('nan'))
+        return dict(mean=float(np.mean(vals)), std=float(np.std(vals)),
+                    min=float(np.min(vals)), max=float(np.max(vals)))
+
     print("\n" + "=" * 80)
     print(f"Multi-Seed Summary  policy={policy_name}  n={len(seeds)}")
-    print(f"  {'metric':<20}  {'value':>10}")
-    print(f"  {'mean_GC':<20}  {float(np.mean(gc_values)):>10.4f}")
-    print(f"  {'std_GC':<20}  {float(np.std(gc_values)):>10.4f}")
-    print(f"  {'min_GC':<20}  {float(np.min(gc_values)):>10.4f}")
-    print(f"  {'max_GC':<20}  {float(np.max(gc_values)):>10.4f}")
+    print(f"  {'metric':<28}  {'mean':>10}  {'std':>10}  {'min':>10}  {'max':>10}")
+    for label, key in [
+        ('general_completion', 'general_completion'),
+        ('cumulative_reward', 'cumulative_reward'),
+        ('energy_per_completed', 'energy_per_completed'),
+        ('avg_wait_ready_to_assigned', 'avg_wait_ready_to_assigned'),
+        ('p95_wait_ready_to_assigned', 'p95_wait_ready_to_assigned'),
+    ]:
+        a = _agg(key)
+        print(f"  {label:<28}  {a['mean']:>10.4f}  {a['std']:>10.4f}"
+              f"  {a['min']:>10.4f}  {a['max']:>10.4f}")
 
     if args.csv_out:
         with open(args.csv_out, 'w', newline='') as f:
@@ -343,6 +395,8 @@ def run_ablation_cutoff(args):
     fieldnames = [
         'order_cutoff_steps', 'seed',
         'generated_total', 'completed_total', 'general_completion',
+        'cumulative_reward', 'energy_total', 'energy_per_completed',
+        'avg_wait_ready_to_assigned', 'p95_wait_ready_to_assigned',
     ]
 
     for K in cutoff_values:
@@ -351,6 +405,9 @@ def run_ablation_cutoff(args):
             row = run_single_episode(args, order_cutoff_steps=K, seed=seed)
             rows.append(row)
             print(f"GC={row['general_completion']:.4f}  "
+                  f"reward={row['cumulative_reward']:.2f}  "
+                  f"energy_pc={row['energy_per_completed']:.3f}  "
+                  f"wait_avg={row['avg_wait_ready_to_assigned']:.2f}  "
                   f"generated={row['generated_total']}  completed={row['completed_total']}")
 
     if args.csv_out:
@@ -363,21 +420,39 @@ def run_ablation_cutoff(args):
 
     # Aggregate per K
     from collections import defaultdict
-    agg = defaultdict(lambda: {'gc': []})
+
+    _AGG_KEYS = [
+        'general_completion', 'cumulative_reward',
+        'energy_per_completed', 'avg_wait_ready_to_assigned',
+    ]
+
+    agg: dict = defaultdict(lambda: {k: [] for k in _AGG_KEYS})
     for row in rows:
         K = row['order_cutoff_steps']
-        agg[K]['gc'].append(row['general_completion'])
+        for key in _AGG_KEYS:
+            val = row[key]
+            if not math.isnan(val):
+                agg[K][key].append(val)
 
     print("\n" + "=" * 80)
     print("Per-K aggregated means:")
-    print(f"  {'K':>6}  {'mean_GC':>10}")
+    print(f"  {'K':>6}  {'mean_GC':>10}  {'mean_reward':>12}  "
+          f"{'mean_energy_pc':>14}  {'mean_wait':>10}")
     summary = {}
     for K in cutoff_values:
-        gc_list = agg[K]['gc']
-        mean_gc = float(np.mean(gc_list)) if gc_list else float('nan')
+        def _mean(lst):
+            return float(np.mean(lst)) if lst else float('nan')
+
+        mean_gc = _mean(agg[K]['general_completion'])
+        mean_rw = _mean(agg[K]['cumulative_reward'])
+        mean_ep = _mean(agg[K]['energy_per_completed'])
+        mean_wt = _mean(agg[K]['avg_wait_ready_to_assigned'])
         summary[K] = {'mean_gc': mean_gc}
-        gc_str = f"{mean_gc:.4f}" if not math.isnan(mean_gc) else "nan"
-        print(f"  {K:>6}  {gc_str:>10}")
+        print(f"  {K:>6}  "
+              f"{'nan' if math.isnan(mean_gc) else f'{mean_gc:.4f}':>10}  "
+              f"{'nan' if math.isnan(mean_rw) else f'{mean_rw:.2f}':>12}  "
+              f"{'nan' if math.isnan(mean_ep) else f'{mean_ep:.3f}':>14}  "
+              f"{'nan' if math.isnan(mean_wt) else f'{mean_wt:.2f}':>10}")
 
     # Determine best K by GC
     valid_gc = {K: v['mean_gc'] for K, v in summary.items() if not math.isnan(v['mean_gc'])}
