@@ -42,6 +42,12 @@ from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 from U11_ablation import _make_env, _compute_completion_stats
 
 try:
+    from U11_plotting import plot_episode_paths as _plot_episode_paths
+    _HAS_PLOTTING = True
+except ImportError:
+    _HAS_PLOTTING = False
+
+try:
     from U10_candidate_generator import MOPSOCandidateGenerator
 
     _HAS_MOPSO = True
@@ -101,10 +107,27 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
 
     executor.run_episode(max_steps=args.max_steps, seed=seed)
 
-    stats = _compute_completion_stats(env)
+    stats = _compute_completion_stats(env, executor)
     stats['seed'] = seed
     stats['rule_id'] = rule_id
     stats['policy'] = f'fixed_rule_{rule_id}'
+
+    if getattr(args, 'plot_paths', False) and _HAS_PLOTTING:
+        gc = stats['general_completion']
+        epc = stats['energy_per_completed']
+        aw = stats['avg_wait_ready_to_assigned']
+        plot_title = (
+            f"Fixed rule {rule_id} | seed={seed} | "
+            f"GC={gc:.3f}  energy_pc={epc:.3f}  wait_avg={aw:.2f}"
+        )
+        save_path = os.path.join(
+            args.plot_dir, f"baseline_rule_{rule_id}_seed_{seed}.png"
+        )
+        _plot_episode_paths(
+            env, save_path, title=plot_title,
+            max_drones=getattr(args, 'plot_max_drones', 20),
+        )
+        print(f"    Plot saved: {save_path}")
 
     return stats
 
@@ -116,18 +139,18 @@ def main():
 
     parser.add_argument("--rule-id", type=int, default=3,
                         help="Fixed rule ID in {0,1,2,3,4} (required unless --all-rules)")
-    parser.add_argument("--all-rules", action="store_true", default=True,
+    parser.add_argument("--all-rules", action="store_true", default=False,
                         help="Run all 5 fixed rules (0..4) sequentially")
     parser.add_argument("--seed", type=int, default=21,
                         help="Random seed for a single episode run (default: 21)")
-    parser.add_argument("--seeds", type=str, default='21,22,23,35,81,105,135,688,918,515',
+    parser.add_argument("--seeds", type=str, default='21',
                         help="Comma-separated seeds to run multiple episodes "
                              "(overrides --seed when provided)")
-    parser.add_argument("--num-drones", type=int, default=20,
+    parser.add_argument("--num-drones", type=int, default=1,
                         help="Number of drones (default: 20)")
     parser.add_argument("--obs-max-orders", type=int, default=200,
                         help="Maximum orders in observation (default: 200)")
-    parser.add_argument("--top-k-merchants", type=int, default=50,
+    parser.add_argument("--top-k-merchants", type=int, default=10,
                         help="Top K merchants (default: 50)")
     parser.add_argument("--candidate-k", type=int, default=10,
                         help="Number of candidates per drone")
@@ -143,6 +166,12 @@ def main():
                         help="Disable MOPSO candidate generator")
     parser.add_argument("--csv-out", type=str, default=None,
                         help="Write per-episode results to this CSV file")
+    parser.add_argument("--plot-paths", action="store_true", default=True,
+                        help="Save per-episode trajectory PNG plots")
+    parser.add_argument("--plot-dir", type=str, default="plots",
+                        help="Directory for trajectory plots (default: plots)")
+    parser.add_argument("--plot-max-drones", type=int, default=20,
+                        help="Maximum number of drone trajectories to render (default: 20)")
 
     args = parser.parse_args()
 
@@ -172,7 +201,10 @@ def main():
             rule_stats.append(stats)
             print(f"  seed={seed:>6}  GC={stats['general_completion']:.4f}  "
                   f"generated={stats['generated_total']}  "
-                  f"completed={stats['completed_total']}")
+                  f"completed={stats['completed_total']}  "
+                  f"reward={stats['cumulative_reward']:.2f}  "
+                  f"energy_pc={stats['energy_per_completed']:.3f}  "
+                  f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}")
 
         gc_values = [s['general_completion'] for s in rule_stats]
         if len(gc_values) > 1:
@@ -202,8 +234,12 @@ def main():
 
     # CSV output
     if args.csv_out:
-        fieldnames = ['rule_id', 'policy', 'seed',
-                      'generated_total', 'completed_total', 'general_completion']
+        fieldnames = [
+            'rule_id', 'policy', 'seed',
+            'generated_total', 'completed_total', 'general_completion',
+            'cumulative_reward', 'energy_total', 'energy_per_completed',
+            'avg_wait_ready_to_assigned', 'p95_wait_ready_to_assigned',
+        ]
         with open(args.csv_out, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()

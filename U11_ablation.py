@@ -42,6 +42,12 @@ from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 
 try:
+    from U11_plotting import plot_episode_paths as _plot_episode_paths
+    _HAS_PLOTTING = True
+except ImportError:
+    _HAS_PLOTTING = False
+
+try:
     from U10_candidate_generator import MOPSOCandidateGenerator
 
     _HAS_MOPSO = True
@@ -133,7 +139,7 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
 def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryEnv:
     """Create environment with the given configuration."""
     return ThreeObjectiveDroneDeliveryEnv(
-        grid_size=16,
+        grid_size=50,
         num_drones=args.num_drones,
         max_orders=args.obs_max_orders,
         num_bases=2,
@@ -257,6 +263,23 @@ def run_single_episode(args, order_cutoff_steps: int, seed: int) -> dict:
               f"n_invalid_rule={action_stats.n_invalid_rule}  "
               f"n_empty_candidates={action_stats.n_empty_candidates}")
 
+    if getattr(args, 'plot_paths', False) and _HAS_PLOTTING:
+        gc = stats['general_completion']
+        epc = stats['energy_per_completed']
+        aw = stats['avg_wait_ready_to_assigned']
+        plot_title = (
+            f"Ablation K={order_cutoff_steps} | seed={seed} | "
+            f"GC={gc:.3f}  energy_pc={epc:.3f}  wait_avg={aw:.2f}"
+        )
+        save_path = os.path.join(
+            args.plot_dir, f"ablation_K_{order_cutoff_steps}_seed_{seed}.png"
+        )
+        _plot_episode_paths(
+            env, save_path, title=plot_title,
+            max_drones=getattr(args, 'plot_max_drones', 20),
+        )
+        print(f"    Plot saved: {save_path}")
+
     return stats
 
 
@@ -344,6 +367,23 @@ def run_multi_seed_eval(args):
                   f"rule_pct={pct}  "
                   f"n_decisions={action_stats.n_decisions}  "
                   f"n_empty={action_stats.n_empty_candidates}")
+
+        if getattr(args, 'plot_paths', False) and _HAS_PLOTTING:
+            gc = stats['general_completion']
+            epc = stats['energy_per_completed']
+            aw = stats['avg_wait_ready_to_assigned']
+            plot_title = (
+                f"{policy_name} | seed={seed} | "
+                f"GC={gc:.3f}  energy_pc={epc:.3f}  wait_avg={aw:.2f}"
+            )
+            save_path = os.path.join(
+                args.plot_dir, f"ablation_seed_{seed}.png"
+            )
+            _plot_episode_paths(
+                env, save_path, title=plot_title,
+                max_drones=getattr(args, 'plot_max_drones', 20),
+            )
+            print(f"    Plot saved: {save_path}")
 
     # Aggregate helpers
     def _agg(key):
@@ -526,11 +566,11 @@ def main():
     )
 
     # Environment parameters
-    parser.add_argument("--num-drones", type=int, default=20,
+    parser.add_argument("--num-drones", type=int, default=1,
                         help="Number of drones (default: 10)")
     parser.add_argument("--obs-max-orders", type=int, default=200,
                         help="Maximum orders in observation (default: 200)")
-    parser.add_argument("--top-k-merchants", type=int, default=50,
+    parser.add_argument("--top-k-merchants", type=int, default=10,
                         help="Top K merchants (default: 50)")
     parser.add_argument("--candidate-k", type=int, default=10,
                         help="Number of candidates per drone (default: 20)")
@@ -562,6 +602,14 @@ def main():
                              "in ablation mode (default: 0..60)")
     parser.add_argument("--csv-out", type=str, default=None,
                         help="Output CSV path for multi-seed or ablation results")
+
+    # Plotting parameters
+    parser.add_argument("--plot-paths", action="store_true", default=True,
+                        help="Save per-episode trajectory PNG plots")
+    parser.add_argument("--plot-dir", type=str, default="plots",
+                        help="Directory for trajectory plots (default: plots)")
+    parser.add_argument("--plot-max-drones", type=int, default=20,
+                        help="Maximum number of drone trajectories to render (default: 20)")
 
     # Other parameters
     parser.add_argument("--seed", type=int, default=21,

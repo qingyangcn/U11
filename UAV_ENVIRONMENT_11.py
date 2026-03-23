@@ -460,8 +460,10 @@ class StateManager:
 class PathVisualizer:
     def __init__(self, grid_size):
         self.grid_size = grid_size
-        # deque(maxlen=100) per drone: O(1) append/eviction, bounded memory
-        self.path_history = defaultdict(lambda: deque(maxlen=100))
+        # Unlimited deque per drone so the full episode trajectory is preserved.
+        # A bounded deque would evict early positions (e.g. base departure) in
+        # longer episodes, causing trajectories to appear to start mid-flight.
+        self.path_history = defaultdict(deque)
         self.planned_paths = {}
 
     def update_path_history(self, drone_id, location):
@@ -1198,7 +1200,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  base_placement_method='kmeans',
                  drone_max_capacity=10,
                  operating_hours=(6, 22),
-                 high_load_factor=2.0,
+                 high_load_factor=0.01,
                  distance_reward_weight=1.0,
                  multi_objective_mode: str = "conditioned",
                  fixed_objective_weights=(0.5, 0.3, 0.2),
