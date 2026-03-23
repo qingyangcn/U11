@@ -86,21 +86,70 @@ def plot_episode_paths(
         )
 
     # ------------------------------------------------------------------ #
-    # Merchant locations                                                   #
+    # Merchant locations (only those active in this episode, top-K cap)   #
     # ------------------------------------------------------------------ #
+    # Collect merchant IDs that actually appeared in orders this episode.
+    # order_count on the merchant dict may not be populated in all
+    # environments, so we derive activity directly from env.orders.
+    merchant_order_counts: dict = {}
+    for order in env.orders.values():
+        mid = order.get("merchant_id")
+        if mid is not None:
+            merchant_order_counts[mid] = merchant_order_counts.get(mid, 0) + 1
+
+    # Sort by order activity (most-active first), cap at top_k_merchants
+    top_k = getattr(env, "top_k_merchants", len(env.merchants))
+    sorted_merchants = sorted(
+        env.merchants.items(),
+        key=lambda kv: merchant_order_counts.get(kv[0], 0),
+        reverse=True,
+    )
+    # Keep only merchants that had at least one order, up to top_k
+    active_merchants = [
+        (mid, m) for mid, m in sorted_merchants
+        if merchant_order_counts.get(mid, 0) > 0
+    ][:top_k]
+
     merchant_plotted = False
-    for merchant_id, merchant in env.merchants.items():
+    for _mid, merchant in active_merchants:
         loc = merchant["location"]
         ax.plot(
             loc[0], loc[1],
             "^",
             color="coral",
-            markersize=6,
-            alpha=0.7,
+            markersize=7,
+            alpha=0.85,
             zorder=5,
             label="Merchant" if not merchant_plotted else "_nolegend_",
         )
         merchant_plotted = True
+
+    # ------------------------------------------------------------------ #
+    # Customer / delivery locations                                        #
+    # ------------------------------------------------------------------ #
+    # Collect unique customer locations from all orders generated this
+    # episode (covers READY, ASSIGNED, PICKED_UP, and COMPLETED states).
+    customer_xs: list = []
+    customer_ys: list = []
+    seen_locs: set = set()
+    for order in env.orders.values():
+        cloc = order.get("customer_location")
+        if cloc is not None and cloc not in seen_locs:
+            customer_xs.append(cloc[0])
+            customer_ys.append(cloc[1])
+            seen_locs.add(cloc)
+
+    if customer_xs:
+        ax.scatter(
+            customer_xs, customer_ys,
+            marker="x",
+            color="steelblue",
+            s=25,
+            linewidths=0.8,
+            alpha=0.6,
+            zorder=4,
+            label="Customer",
+        )
 
     # ------------------------------------------------------------------ #
     # Formatting                                                           #
