@@ -460,8 +460,10 @@ class StateManager:
 class PathVisualizer:
     def __init__(self, grid_size):
         self.grid_size = grid_size
-        # deque(maxlen=100) per drone: O(1) append/eviction, bounded memory
-        self.path_history = defaultdict(lambda: deque(maxlen=100))
+        # Unlimited deque per drone so the full episode trajectory is preserved.
+        # A bounded deque would evict early positions (e.g. base departure) in
+        # longer episodes, causing trajectories to appear to start mid-flight.
+        self.path_history = defaultdict(deque)
         self.planned_paths = {}
 
     def update_path_history(self, drone_id, location):
