@@ -463,15 +463,40 @@ class PathVisualizer:
         # Unlimited deque per drone so the full episode trajectory is preserved.
         # A bounded deque would evict early positions (e.g. base departure) in
         # longer episodes, causing trajectories to appear to start mid-flight.
+        #
+        # Each entry is either a (step, x, y) tuple or None.
+        # None is a segment-break sentinel inserted between delivery trips so
+        # the plotting code can break the line and avoid false cross-map connections.
         self.path_history = defaultdict(deque)
         self.planned_paths = {}
 
-    def update_path_history(self, drone_id, location):
-        """更新无人机路径历史"""
+    def update_path_history(self, drone_id, location, step):
+        """记录无人机位置历史。
+
+        每条记录存储 (step, x, y) 三元组，以便绘图时可按时间步排序。
+        连续重复位置（无人机静止时）会被跳过，避免产生冗余数据点。
+        段落分隔哨兵（None）之后的第一个位置总是被记录，
+        以确保新轨迹段从正确位置开始。
+        """
         hist = self.path_history[drone_id]
-        # 只记录位置变化
-        if not hist or hist[-1] != location:
-            hist.append(location)
+        # Always record after a segment-break sentinel (None) or at episode start;
+        # otherwise skip duplicate consecutive (x, y) to reduce noise.
+        if not hist or hist[-1] is None or hist[-1][1:] != location:
+            hist.append((step, location[0], location[1]))
+
+    def mark_segment_break(self, drone_id):
+        """在轨迹历史中插入段落分隔哨兵（None）。
+
+        当无人机从基站出发开始新一轮配送任务时调用，用于标记上一段轨迹的结束。
+        绘图时，哨兵被转换为 NaN，使 matplotlib 在该处断开折线，
+        从而避免跨任务段的错误连线（如将上一次返回基站的终点直接连到
+        下一次出发点，产生跨图长线）。
+        """
+        hist = self.path_history[drone_id]
+        # Only insert a sentinel if there are existing positions and the last
+        # entry is not already a sentinel (avoid consecutive None values).
+        if hist and hist[-1] is not None:
+            hist.append(None)
 
     def update_planned_path(self, drone_id, current_loc, target_loc, route_preferences=None):
         """更新规划路径"""
@@ -3405,6 +3430,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # KEY FIX: Set serving_order_id when assigning to IDLE/RETURNING/CHARGING drone
             drone['serving_order_id'] = order_id
 
+            # Insert a trajectory segment break when the drone departs from base
+            # (IDLE or CHARGING) so the plotter does not connect the previous
+            # return-to-base leg to this new outbound leg with a straight line.
+            # RETURNING_TO_BASE mid-flight reassignments are intentionally excluded:
+            # the path is already continuous and does not need a break there.
+            if drone['status'] in [DroneStatus.IDLE, DroneStatus.CHARGING]:
+                self.path_visualizer.mark_segment_break(drone_id)
+
             self._start_new_task(drone_id, drone, target_merchant_loc)
             self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT, target_merchant_loc)
 
@@ -3550,7 +3583,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._sync_drone_status_with_route()
 
         for drone_id, drone in self.drones.items():
-            self.path_visualizer.update_path_history(drone_id, drone["location"])
+            # Record position with current step so the plotting code can sort by
+            # time and detect out-of-order entries defensively.
+            self.path_visualizer.update_path_history(
+                drone_id, drone["location"], self.time_system.current_step
+            )
 
             if drone["status"] in [
                 DroneStatus.FLYING_TO_MERCHANT,
