@@ -41,27 +41,64 @@ def plot_episode_paths(
     # ------------------------------------------------------------------ #
     # Drone trajectories                                                   #
     # ------------------------------------------------------------------ #
+    # path_history[drone_id] is a deque of (step, x, y) tuples and None
+    # sentinels.  None values mark boundaries between delivery trips so
+    # this loop can break the plotted line there, preventing false
+    # cross-map connections caused by joining the end of one trip to the
+    # start of the next.  Within each segment the entries are in
+    # chronological order (step is non-decreasing) but we sort defensively
+    # to guard against any future out-of-order recording.
     path_history = env.path_visualizer.path_history
     drone_ids = sorted(path_history.keys())[:max_drones]
 
     cmap = plt.cm.tab20
     for i, drone_id in enumerate(drone_ids):
-        path = list(path_history[drone_id])
-        if len(path) < 2:
+        raw = list(path_history[drone_id])
+        if not raw:
             continue
-        xs = [p[0] for p in path]
-        ys = [p[1] for p in path]
+
         color = cmap(i % 20)
-        ax.plot(
-            xs, ys,
-            "-",
-            color=color,
-            alpha=0.55,
-            linewidth=1.0,
-            label=f"Drone {drone_id}",
-        )
-        # Mark the end position with a filled circle
-        ax.plot(xs[-1], ys[-1], "o", color=color, markersize=4, zorder=4)
+
+        # Split the raw deque into continuous segments at None sentinels.
+        # Each segment is a list of (step, x, y) tuples that belong to one
+        # uninterrupted flight leg.  Sorting by step within each segment is
+        # a defensive measure against any recording-order anomaly.
+        segments: list = []
+        current_seg: list = []
+        for entry in raw:
+            if entry is None:
+                # Segment-break sentinel: commit current segment and start a new one
+                if current_seg:
+                    segments.append(current_seg)
+                current_seg = []
+            else:
+                current_seg.append(entry)
+        if current_seg:
+            segments.append(current_seg)
+
+        # Plot each segment as an independent line so trips are not connected.
+        first_seg = True
+        for seg in segments:
+            if len(seg) < 2:
+                continue
+            # Sort within segment by step to ensure correct visual order
+            seg.sort(key=lambda r: r[0])
+            xs = [r[1] for r in seg]
+            ys = [r[2] for r in seg]
+            ax.plot(
+                xs, ys,
+                "-",
+                color=color,
+                alpha=0.55,
+                linewidth=1.0,
+                label=f"Drone {drone_id}" if first_seg else "_nolegend_",
+            )
+            first_seg = False
+
+        # Mark the last recorded position with a filled circle
+        last_entry = next((e for e in reversed(raw) if e is not None), None)
+        if last_entry is not None:
+            ax.plot(last_entry[1], last_entry[2], "o", color=color, markersize=4, zorder=4)
 
     # ------------------------------------------------------------------ #
     # Base locations                                                       #
