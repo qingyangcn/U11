@@ -464,7 +464,6 @@ class PathVisualizer:
         # A bounded deque would evict early positions (e.g. base departure) in
         # longer episodes, causing trajectories to appear to start mid-flight.
         self.path_history = defaultdict(deque)
-        self.planned_paths = {}
 
     def update_path_history(self, drone_id, location):
         """更新无人机路径历史"""
@@ -473,77 +472,17 @@ class PathVisualizer:
         if not hist or hist[-1] != location:
             hist.append(location)
 
-    def update_planned_path(self, drone_id, current_loc, target_loc, route_preferences=None):
-        """更新规划路径"""
-        if route_preferences is not None:
-            # 基于路径偏好生成规划路径
-            planned_path = self._generate_path_from_preferences(current_loc, target_loc, route_preferences)
-            self.planned_paths[drone_id] = planned_path
-
-    def _generate_path_from_preferences(self, start, end, preferences):
-        """基于路径偏好生成路径"""
-        path = [start]
-        current = start
-
-        max_steps = 20  # 最大路径规划步数
-        for step in range(max_steps):
-            if self._distance(current, end) < 1.0:
-                break
-
-            # 计算方向向量
-            dx = end[0] - current[0]
-            dy = end[1] - current[1]
-
-            # 标准化方向
-            dist = max(0.1, math.sqrt(dx * dx + dy * dy))
-            dx /= dist
-            dy /= dist
-
-            # 应用路径偏好
-            next_x = current[0] + dx
-            next_y = current[1] + dy
-
-            # 确保在网格范围内
-            next_x = max(0, min(self.grid_size - 1, next_x))
-            next_y = max(0, min(self.grid_size - 1, next_y))
-
-            # 检查路径偏好
-            x_int, y_int = int(next_x), int(next_y)
-            if 0 <= x_int < self.grid_size and 0 <= y_int < self.grid_size:
-                # 确保 preference 是标量值
-                preference_value = preferences[x_int, y_int]
-                if hasattr(preference_value, '__iter__'):
-                    preference_value = float(np.mean(preference_value))
-                else:
-                    preference_value = float(preference_value)
-
-                # 高偏好区域更容易被选中
-                if random.random() < preference_value:
-                    current = (next_x, next_y)
-                    path.append(current)
-                else:
-                    # 随机探索其他方向
-                    current = (
-                        current[0] + random.uniform(-0.5, 0.5),
-                        current[1] + random.uniform(-0.5, 0.5)
-                    )
-                    current = (
-                        max(0, min(self.grid_size - 1, current[0])),
-                        max(0, min(self.grid_size - 1, current[1]))
-                    )
-                    path.append(current)
-
-        path.append(end)  # 确保路径到达目标
-        return path
-
-    def _distance(self, loc1, loc2):
-        """计算两点距离"""
-        return math.sqrt((loc1[0] - loc2[0]) ** 2 + (loc1[1] - loc2[1]) ** 2)
+    def break_segment(self, drone_id):
+        """在当前位置插入 None 哨兵，绘图时断开连线（避免跨任务段的乱连线）。
+        应在无人机返回基站落地后调用，使每次出发都是独立的轨迹段。"""
+        hist = self.path_history[drone_id]
+        # 仅当末尾不是已有断点时才插入，避免连续断点
+        if hist and hist[-1] is not None:
+            hist.append(None)
 
     def clear_paths(self):
         """清除所有路径"""
         self.path_history.clear()
-        self.planned_paths.clear()
 
 
 # 位置数据加载器类
@@ -1973,6 +1912,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         }
 
         self.path_visualizer.clear_paths()
+        # 记录每架无人机的起始基站位置，保证轨迹从基站出发（B问题修复）
+        for _drone_id, _drone in self.drones.items():
+            self.path_visualizer.update_path_history(_drone_id, _drone['location'])
 
         self._update_weather_from_dataset()
         self._generate_morning_orders()
@@ -3698,6 +3640,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             print(f"[Drone {drone_id}] D stop {oid} 订单已取消或已送达，跳过")
                         drone['planned_stops'].popleft()
                         continue
+                    # 硬约束：只有已取货的订单才能飞往顾客
+                    # 若订单尚未 PICKED_UP（如仍为 ASSIGNED），则继续等待取货而非直飞顾客
+                    if o['status'] != OrderStatus.PICKED_UP:
+                        if self.debug_state_warnings:
+                            print(f"[Drone {drone_id}] D stop {oid} 订单未取货(status={o['status']})，跳过，等待取货")
+                        drone['planned_stops'].popleft()
+                        continue
 
             drone['current_stop'] = stop
             self._start_new_task(drone_id, drone, loc)
@@ -3871,9 +3820,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         Arrival handler:
           - If planned_stops is present: execute interleaved multi-merchant pickup/delivery.
           - Else if serving_order_id is present: task-selection mode logic.
-          - Else: fallback to legacy single/batch logic.
+          - Else: drone arrived without a plan – reset to base.
         """
-        # -------- New route-plan logic (priority) --------
+        # -------- Route-plan logic (priority) --------
         if drone.get('planned_stops') and len(drone['planned_stops']) > 0:
             stop = drone['planned_stops'][0]
             stype = stop.get('type', None)
@@ -3985,70 +3934,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             return
 
-        # -------- Legacy logic (batch orders) --------
-        # Only execute if legacy fallback is enabled
-        if not self.enable_legacy_fallback:
-            # Legacy fallback is disabled - track blocked attempt with reason
-            self.legacy_blocked_count += 1
-
-            # Determine reason for blocking
-            if serving_order_id is not None:
-                reason = "has_serving_order_id"
-            elif drone.get('planned_stops') and len(drone['planned_stops']) > 0:
-                reason = "has_planned_stops"
-            else:
-                reason = f"status_{drone['status'].name}"
-
-            self.legacy_blocked_reasons[reason] += 1
-
-            if self.debug_state_warnings:
-                print(f"[Legacy Blocked] Drone {drone_id} arrival at {drone['status']} - "
-                      f"serving_order_id={serving_order_id}, reason={reason}, total_blocked={self.legacy_blocked_count}")
-            # Without legacy fallback, drone should remain in current state or go idle
-            # If drone has no serving_order_id and no planned route, it should be idle
-            if serving_order_id is None and (not drone.get('planned_stops') or len(drone['planned_stops']) == 0):
-                if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.FLYING_TO_CUSTOMER]:
-                    # Reset to idle - PPO/dispatcher will decide next action
-                    self._safe_reset_drone(drone_id, drone)
+        # -------- No active route or serving order --------
+        # Drone arrived without a task assignment.  For FLYING_TO_MERCHANT or
+        # FLYING_TO_CUSTOMER with no context, reset and return to base.
+        if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.FLYING_TO_CUSTOMER]:
+            self._safe_reset_drone(drone_id, drone)
             return
 
-        # Legacy fallback enabled - execute original legacy logic
-        if drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
-            if 'batch_orders' in drone and drone['batch_orders']:
-                self._handle_batch_pickup(drone_id, drone)
-            else:
-                # Legacy single-order mode - only use if not in task-selection mode
-                if serving_order_id is None:
-                    assigned_order = self._get_drone_assigned_order(drone_id)
-                    if assigned_order and assigned_order['status'] == OrderStatus.ASSIGNED:
-                        oid = assigned_order['id']
-                        self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP,
-                                                               reason="arrived_merchant_pickup")
-                        assigned_order['pickup_time'] = self.time_system.current_step
-                        drone['cargo'].add(oid)
-
-                        self._start_new_task(drone_id, drone, assigned_order['customer_location'])
-                        self.state_manager.update_drone_status(
-                            drone_id, DroneStatus.FLYING_TO_CUSTOMER,
-                            target_location=assigned_order['customer_location']
-                        )
-                    else:
-                        self._safe_reset_drone(drone_id, drone)
-                else:
-                    self._safe_reset_drone(drone_id, drone)
-
-        elif drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-            if 'batch_orders' in drone and drone['batch_orders']:
-                self._handle_batch_delivery(drone_id, drone)
-            else:
-                # Legacy single-order mode - only use if not in task-selection mode
-                if serving_order_id is None:
-                    assigned_order = self._get_drone_assigned_order(drone_id)
-                    if assigned_order and assigned_order['status'] == OrderStatus.PICKED_UP:
-                        self._complete_order_delivery(assigned_order['id'], drone_id)
-                self._safe_reset_drone(drone_id, drone)
-
-        elif drone['status'] == DroneStatus.RETURNING_TO_BASE:
+        if drone['status'] == DroneStatus.RETURNING_TO_BASE:
             # Defensive: resolve any PICKED_UP/ASSIGNED orders that are still linked
             # to this drone before we clear its state.  This guards against cases
             # where the send-to-base path did not fully clean up (e.g. task-selection
@@ -4069,15 +3962,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
 
             drone['current_load'] = 0
-            self._clear_drone_batch_state(drone)
             self._clear_task_data(drone_id, drone)
 
-            # --- ADD: clear route-plan state ---
+            # Clear route-plan state and record trajectory break
             drone['planned_stops'] = deque()
             drone['cargo'] = set()
             drone['current_stop'] = None
             drone['route_committed'] = False
-            drone['serving_order_id'] = None  # Clear task-selection state
+            drone['serving_order_id'] = None
+            # 无人机返回基站落地：在轨迹中插入断点，避免下次出发时与本次路径相连
+            self.path_visualizer.break_segment(drone_id)
 
     # ------------------ 单段任务统计（保持原逻辑）------------------
 
