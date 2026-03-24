@@ -60,113 +60,236 @@ except ImportError:
 # Environment diagnostic helpers
 # ---------------------------------------------------------------------------
 
-_STATUS_ABBR = {
+_DRONE_STATUS_LABEL = {
     DroneStatus.IDLE: 'IDLE',
-    DroneStatus.ASSIGNED: 'ASGN',
-    DroneStatus.FLYING_TO_MERCHANT: 'FLY→M',
-    DroneStatus.WAITING_FOR_PICKUP: 'WAIT',
-    DroneStatus.FLYING_TO_CUSTOMER: 'FLY→C',
-    DroneStatus.DELIVERING: 'DLVR',
-    DroneStatus.RETURNING_TO_BASE: 'RTB',
-    DroneStatus.CHARGING: 'CHRG',
+    DroneStatus.ASSIGNED: 'ASSIGNED',
+    DroneStatus.FLYING_TO_MERCHANT: 'FLY→MERCHANT',
+    DroneStatus.WAITING_FOR_PICKUP: 'WAIT_PICKUP',
+    DroneStatus.FLYING_TO_CUSTOMER: 'FLY→CUSTOMER',
+    DroneStatus.DELIVERING: 'DELIVERING',
+    DroneStatus.RETURNING_TO_BASE: 'RETURN_BASE',
+    DroneStatus.CHARGING: 'CHARGING',
 }
 
+# Keep legacy alias so any external code that imported _STATUS_ABBR still works.
+_STATUS_ABBR = _DRONE_STATUS_LABEL
 
-def print_env_diagnostic(env: ThreeObjectiveDroneDeliveryEnv,
-                         step_label: str = '',
-                         show_orders: bool = True,
-                         show_merchants: bool = True) -> None:
-    """Print a concise snapshot of environment state for debugging.
 
-    Prints:
-    * Per-drone: status, serving order, load, cargo, planned-stop count,
-      current location, target location.
-    * Order status breakdown (counts and active READY/ASSIGNED ids).
-    * Merchant queue summary (pending orders queued at each merchant).
-    * Daily stats snapshot.
+def _fmt_loc(loc) -> str:
+    """Format a (x, y) location tuple as a compact string."""
+    if loc is None:
+        return '—'
+    return f"({loc[0]:.1f},{loc[1]:.1f})"
+
+
+def _fmt_ids(ids, limit: int = 8) -> str:
+    """Format a list of IDs, truncating at *limit* with a '+N more' suffix."""
+    if not ids:
+        return '—'
+    preview = [str(i) for i in ids[:limit]]
+    suffix = f' +{len(ids)-limit}' if len(ids) > limit else ''
+    return '[' + ','.join(preview) + suffix + ']'
+
+
+def _table(title: str, headers: list, rows: list) -> None:
+    """Print a bordered ASCII table.
 
     Args:
-        env: The UAV environment (may be wrapped; uses env.unwrapped internally).
-        step_label: Optional label prepended to the header line.
-        show_orders: Whether to print the order status section.
-        show_merchants: Whether to print the merchant queue section.
+        title:   Section title printed above the table.
+        headers: List of column header strings.
+        rows:    List of row lists (each element converted to str).
+    """
+    str_rows = [[str(c) for c in r] for r in rows]
+    col_widths = [len(h) for h in headers]
+    for row in str_rows:
+        for i, cell in enumerate(row):
+            if i < len(col_widths):
+                col_widths[i] = max(col_widths[i], len(cell))
+
+    sep = '+-' + '-+-'.join('-' * w for w in col_widths) + '-+'
+    hdr = '| ' + ' | '.join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + ' |'
+
+    print(f"\n  {title}")
+    print('  ' + sep)
+    print('  ' + hdr)
+    print('  ' + sep)
+    if str_rows:
+        for row in str_rows:
+            padded = [row[i].ljust(col_widths[i]) if i < len(row) else ' ' * col_widths[i]
+                      for i in range(len(headers))]
+            print('  | ' + ' | '.join(padded) + ' |')
+    else:
+        empty_row = '| ' + ' | '.join(' ' * w for w in col_widths) + ' |'
+        print('  ' + empty_row.replace('|  |', '| (no data) |', 1))
+    print('  ' + sep)
+
+
+def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
+                     step_label: str = '',
+                     max_orders: int = 30) -> None:
+    """Print four aligned ASCII tables summarising the current environment state.
+
+    Tables printed:
+    1. **Drone** — ID, status, position, destination, accepted order IDs, load, battery
+    2. **Order** — ID, status, merchant location, customer location, drone ID,
+                   pickup timestamp, delivery timestamp
+    3. **Customer** — customer index (per unique location), location, order ID
+    4. **Merchant** — ID, location, queue depth, pending order IDs
+
+    Args:
+        env: The UAV environment (wrapped or raw).
+        step_label: Optional extra label shown in the section header.
+        max_orders: Maximum number of active orders shown in the Order table
+                    (truncated to avoid overwhelming output).
     """
     raw = getattr(env, 'unwrapped', env)
     ts = raw.time_system
     step = ts.current_step
-    header = f"[Diag step={step} hour={ts.current_hour:.1f}{' | ' + step_label if step_label else ''}]"
-    print("─" * 70)
-    print(header)
 
-    # ── Drone table ──────────────────────────────────────────────────────────
-    print("  Drones:")
+    label_part = f"  |  {step_label}" if step_label else ''
+    print('\n' + '=' * 80)
+    print(f"  ENV SNAPSHOT  step={step}  hour={ts.current_hour:.1f}{label_part}")
+    print(f"  generated={raw.daily_stats['orders_generated']}"
+          f"  completed={raw.daily_stats['orders_completed']}"
+          f"  cancelled={raw.daily_stats.get('orders_cancelled', 0)}"
+          f"  active={len(raw.active_orders)}")
+    print('=' * 80)
+
+    # ── 1. Drone table ────────────────────────────────────────────────────────
+    drone_rows = []
     for did, drone in sorted(raw.drones.items()):
-        status_str = _STATUS_ABBR.get(drone['status'], str(drone['status'].value))
+        status_lbl = _DRONE_STATUS_LABEL.get(drone['status'],
+                                             str(drone['status'].value))
+        pos = _fmt_loc(drone.get('location'))
+        dest = _fmt_loc(drone.get('target_location'))
         load = drone['current_load']
         cap = drone['max_capacity']
+        battery = drone.get('battery_level', float('nan'))
+
+        # Accepted orders = cargo (picked up but not delivered) + planned deliveries
+        cargo: set = drone.get('cargo', set())
         serving = drone.get('serving_order_id')
-        cargo = drone.get('cargo', set())
-        n_stops = len(drone.get('planned_stops', []))
-        loc = drone.get('location')
-        tgt = drone.get('target_location')
+        planned = [
+            s['order_id'] for s in drone.get('planned_stops', [])
+            if s.get('type') == 'D'
+        ] if drone.get('planned_stops') else []
+        accepted = sorted(
+            cargo
+            | ({serving} if serving is not None else set())
+            | set(planned)
+        )
 
-        loc_str = f"({loc[0]:.1f},{loc[1]:.1f})" if loc is not None else "?"
-        tgt_str = f"→({tgt[0]:.1f},{tgt[1]:.1f})" if tgt is not None else ""
-        cargo_str = f" cargo={sorted(cargo)}" if cargo else ""
-        serving_str = f" srv=#{serving}" if serving is not None else ""
-        stops_str = f" stops={n_stops}" if n_stops else ""
-        print(f"    D{did:02d}: {status_str:<7} load={load}/{cap}"
-              f"{serving_str}{cargo_str}{stops_str}"
-              f"  pos={loc_str}{tgt_str}")
+        drone_rows.append([
+            f"D{did:02d}",
+            status_lbl,
+            pos,
+            dest,
+            _fmt_ids(accepted),
+            f"{load}/{cap}",
+            f"{battery:.0f}%",
+        ])
 
-    # ── Order status breakdown ────────────────────────────────────────────────
-    if show_orders:
-        status_counts: dict = defaultdict(int)
-        status_ids: dict = defaultdict(list)
-        for oid in raw.active_orders:
-            o = raw.orders[oid]
-            s = o['status']
-            status_counts[s] += 1
-            if s in (OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
-                status_ids[s].append(oid)
+    _table(
+        "① Drone Status",
+        ["DroneID", "Status", "Position", "Destination", "Accepted Orders", "Load", "Battery"],
+        drone_rows,
+    )
 
-        gen = raw.daily_stats['orders_generated']
-        done = raw.daily_stats['orders_completed']
-        cxl = raw.daily_stats.get('orders_cancelled', 0)
-        pending_active = len(raw.active_orders)
+    # ── 2. Order table ────────────────────────────────────────────────────────
+    active_sorted = sorted(raw.active_orders)[:max_orders]
+    order_rows = []
+    for oid in active_sorted:
+        o = raw.orders.get(oid)
+        if o is None:
+            continue
+        status_name = o['status'].name if hasattr(o['status'], 'name') else str(o['status'])
+        merch_loc = _fmt_loc(o.get('merchant_location'))
+        cust_loc = _fmt_loc(o.get('customer_location'))
+        drone_id = o.get('assigned_drone', -1)
+        drone_str = f"D{drone_id:02d}" if drone_id >= 0 else '—'
+        pickup_t = o.get('pickup_time')
+        delivery_t = o.get('delivery_time')
+        order_rows.append([
+            f"#{oid}",
+            status_name,
+            merch_loc,
+            cust_loc,
+            drone_str,
+            str(pickup_t) if pickup_t is not None else '—',
+            str(delivery_t) if delivery_t is not None else '—',
+        ])
+    if len(raw.active_orders) > max_orders:
+        order_rows.append([
+            f"... +{len(raw.active_orders) - max_orders} more",
+            '', '', '', '', '', '',
+        ])
 
-        parts = []
-        for st in (OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP,
-                   OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.PREPARING):
-            if status_counts[st]:
-                parts.append(f"{st.name}={status_counts[st]}")
-        parts_str = '  '.join(parts) if parts else 'none'
-        print(f"  Orders: active={pending_active}  {parts_str}"
-              f"  | generated={gen}  completed={done}  cancelled={cxl}")
+    _table(
+        "② Order Status",
+        ["OrderID", "Status", "MerchantLoc", "CustomerLoc", "DroneID",
+         "PickupStep", "DeliveryStep"],
+        order_rows,
+    )
 
-        ready_ids = status_ids[OrderStatus.READY]
-        if ready_ids:
-            preview = ready_ids[:8]
-            more = f" …+{len(ready_ids)-8}" if len(ready_ids) > 8 else ""
-            print(f"    READY ids : {preview}{more}")
-        assigned_ids = status_ids[OrderStatus.ASSIGNED]
-        if assigned_ids:
-            print(f"    ASSIGNED  : {assigned_ids[:8]}")
-        picked_ids = status_ids[OrderStatus.PICKED_UP]
-        if picked_ids:
-            print(f"    PICKED_UP : {picked_ids[:8]}")
+    # ── 3. Customer table ─────────────────────────────────────────────────────
+    # Customers are identified by unique customer_location across active orders.
+    # We assign a stable customer index based on insertion order.
+    cust_map: dict = {}          # location_key -> (cust_idx, [order_ids])
+    cust_idx_counter = 0
+    for oid in sorted(raw.active_orders):
+        o = raw.orders.get(oid)
+        if o is None:
+            continue
+        cloc = o.get('customer_location')
+        if cloc is None:
+            continue
+        key = (round(cloc[0], 2), round(cloc[1], 2))
+        if key not in cust_map:
+            cust_map[key] = (cust_idx_counter, cloc, [])
+            cust_idx_counter += 1
+        cust_map[key][2].append(oid)
 
-    # ── Merchant queues ───────────────────────────────────────────────────────
-    if show_merchants:
-        busy_merchants = {mid: len(m['queue'])
-                          for mid, m in raw.merchants.items()
-                          if len(m['queue']) > 0}
-        if busy_merchants:
-            items = sorted(busy_merchants.items(), key=lambda kv: -kv[1])
-            summary = '  '.join(f"M{mid}(q={q})" for mid, q in items[:10])
-            print(f"  Merchants with queue: {summary}")
-        else:
-            print("  Merchants: all queues empty")
+    customer_rows = []
+    for key, (cidx, cloc, order_ids) in sorted(cust_map.items(),
+                                                key=lambda kv: kv[1][0]):
+        customer_rows.append([
+            f"C{cidx:03d}",
+            _fmt_loc(cloc),
+            _fmt_ids(order_ids),
+        ])
+
+    _table(
+        "③ Customer Status",
+        ["CustID", "Location", "OrderIDs"],
+        customer_rows,
+    )
+
+    # ── 4. Merchant table ─────────────────────────────────────────────────────
+    merchant_rows = []
+    for mid, m in sorted(raw.merchants.items()):
+        queue_ids = list(m['queue'])
+        queue_depth = len(queue_ids)
+        # Merchant status: BUSY if queue non-empty, else IDLE
+        m_status = f"BUSY(q={queue_depth})" if queue_depth > 0 else 'IDLE'
+        merchant_rows.append([
+            str(mid),
+            _fmt_loc(m.get('location')),
+            m_status,
+            _fmt_ids(queue_ids),
+        ])
+
+    _table(
+        "④ Merchant Status",
+        ["MerchantID", "Location", "Status", "PendingOrderIDs"],
+        merchant_rows,
+    )
+
+    print()  # trailing blank line
+
+
+# Backward-compatible alias so existing call-sites that import print_env_diagnostic
+# (e.g. baseline_fixed_rules.py) continue to work without changes.
+print_env_diagnostic = print_env_tables
 
 
 def print_greedy_analysis(rule_counter: Counter, reward_history: list,

@@ -46,7 +46,8 @@ from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 from U11_ablation import (
     _make_env,
     _compute_completion_stats,
-    print_env_diagnostic,
+    print_env_tables,
+    print_env_diagnostic,  # backward-compatible alias for print_env_tables
     print_greedy_analysis,
     _run_diag_episode,
 )
