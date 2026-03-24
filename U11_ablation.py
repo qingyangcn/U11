@@ -264,116 +264,11 @@ def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
         customer_rows,
     )
 
-    # ── 4. Merchant table ─────────────────────────────────────────────────────
-    merchant_rows = []
-    for mid, m in sorted(raw.merchants.items()):
-        queue_ids = list(m['queue'])
-        queue_depth = len(queue_ids)
-        # Merchant status: BUSY if queue non-empty, else IDLE
-        m_status = f"BUSY(q={queue_depth})" if queue_depth > 0 else 'IDLE'
-        merchant_rows.append([
-            str(mid),
-            _fmt_loc(m.get('location')),
-            m_status,
-            _fmt_ids(queue_ids),
-        ])
-
-    _table(
-        "④ Merchant Status",
-        ["MerchantID", "Location", "Status", "PendingOrderIDs"],
-        merchant_rows,
-    )
-
-    print()  # trailing blank line
 
 
 # Backward-compatible alias so existing call-sites that import print_env_diagnostic
 # (e.g. baseline_fixed_rules.py) continue to work without changes.
 print_env_diagnostic = print_env_tables
-
-
-def print_greedy_analysis(rule_counter: Counter, reward_history: list,
-                          decision_count: int) -> None:
-    """Analyse whether decision patterns suggest greedy or return-optimising behavior.
-
-    Prints:
-    * Rule selection distribution.
-    * Per-step reward statistics.
-    * Qualitative verdict on greedy vs return-optimizing behavior.
-
-    Args:
-        rule_counter: Counter mapping rule_id → number of times selected.
-        reward_history: List of scalar rewards received at each env step.
-        decision_count: Total number of decision calls made.
-    """
-    print("\n" + "=" * 70)
-    print("Decision-Pattern Analysis: Greedy vs. Return-Optimisation")
-    print("=" * 70)
-
-    # Rule distribution
-    total = sum(rule_counter.values())
-    if total > 0:
-        print("  Rule selection distribution:")
-        rule_names = {
-            0: "default/highest-priority",
-            1: "alt-rule-1",
-            2: "EDF (earliest deadline)",
-            3: "nearest pickup",
-            4: "slack-per-distance",
-        }
-        for rid in sorted(rule_counter):
-            cnt = rule_counter[rid]
-            pct = 100.0 * cnt / total
-            print(f"    Rule {rid} ({rule_names.get(rid, '?'):28s}): "
-                  f"{cnt:5d} ({pct:5.1f}%)")
-    else:
-        print("  No rule selections recorded.")
-
-    # Reward statistics
-    if reward_history:
-        arr = np.array(reward_history, dtype=np.float64)
-        nonzero = arr[arr != 0]
-        print(f"\n  Reward statistics (all {len(arr)} steps):")
-        print(f"    mean={arr.mean():.4f}  std={arr.std():.4f}  "
-              f"min={arr.min():.4f}  max={arr.max():.4f}")
-        print(f"    non-zero steps: {len(nonzero)} / {len(arr)}"
-              f"  ({100*len(nonzero)/max(1,len(arr)):.1f}%)")
-        if len(nonzero):
-            print(f"    non-zero mean={nonzero.mean():.4f}  "
-                  f"non-zero std={nonzero.std():.4f}")
-        # Cumulative return over time (plot a coarse view)
-        cum = np.cumsum(arr)
-        n_seg = min(10, len(cum))
-        seg_size = max(1, len(cum) // n_seg)
-        cum_samples = [float(cum[min(i * seg_size, len(cum) - 1)])
-                       for i in range(1, n_seg + 1)]
-        print(f"    cumulative return (coarse): "
-              + "  ".join(f"{v:.1f}" for v in cum_samples))
-
-    # Verdict
-    print("\n  ── Verdict ──")
-    dominant_rule = rule_counter.most_common(1)[0][0] if rule_counter else -1
-    dominant_pct = (100.0 * rule_counter[dominant_rule] / max(1, total)
-                    if rule_counter else 0.0)
-    if dominant_pct > 90:
-        if dominant_rule == 3:
-            print("  ⚠  Rule 3 (nearest pickup) was used >90% of the time.")
-            print("     This is *greedy* behavior: the agent always picks the")
-            print("     closest order rather than planning long-term routes.")
-            print("     If this is the trained PPO policy, the policy has collapsed")
-            print("     to a greedy heuristic and is NOT maximizing cumulative return.")
-        else:
-            print(f"  ⚠  A single rule ({dominant_rule}) dominates ({dominant_pct:.1f}%).")
-            print("     The policy may have collapsed to a greedy heuristic.")
-    elif total == 0:
-        print("  ℹ  No decisions recorded — check executor configuration.")
-    else:
-        print("  ✓  Multiple rules used. Policy appears to vary its decisions,")
-        print("     which is consistent with return-optimizing (non-greedy) behavior.")
-        print("     NOTE: PPO with gamma=0.99 and GAE(lambda=0.95) maximizes")
-        print("     G_t = Σ γᵏ·r_{t+k}  (discounted cumulative return),")
-        print("     NOT the greedy immediate reward.  Training is meaningful.")
-    print("=" * 70)
 
 
 def _run_diag_episode(executor: DecentralizedEventDrivenExecutor,
@@ -528,9 +423,10 @@ def _make_env(args, order_cutoff_steps: int = 0) -> ThreeObjectiveDroneDeliveryE
         energy_alpha=0.5,
         battery_return_threshold=10.0,
         multi_objective_mode="fixed",
-        candidate_update_interval=8,
+        candidate_update_interval=1,
         candidate_fallback_enabled=False,
         order_cutoff_steps=order_cutoff_steps,
+        operating_hours=(10,14),
     )
 
 
@@ -945,7 +841,6 @@ def run_sanity_check(args):
               f"energy_pc={stats['energy_per_completed']:.3f}  "
               f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}")
 
-        print_greedy_analysis(rule_counter, reward_history, decision_count)
     else:
         executor.run_episode(max_steps=args.max_steps, seed=args.seed)
 
@@ -1006,7 +901,7 @@ def main():
     parser.add_argument("--seed", type=int, default=21,
                         help="Random seed for single-episode mode (default: 21); "
                              "overridden when --seeds contains multiple values")
-    parser.add_argument("--seeds", type=str, default='21,22,23,35,81,105,135,688,918,515',
+    parser.add_argument("--seeds", type=str, default='21',
                         help="Comma-separated seed list.  When provided in non-ablation mode "
                              "the script runs one episode per seed and prints aggregate stats.  "
                              "In ablation mode seeds are used for the K-sweep.")
@@ -1015,7 +910,7 @@ def main():
     parser.add_argument("--track-action-stats", action="store_true", default=True,
                         help="Track and print rule selection distribution after each episode "
                              "(default: False)")
-    parser.add_argument("--diag-interval", type=int, default=0,
+    parser.add_argument("--diag-interval", type=int, default=1,
                         help="Print environment diagnostic every N decision steps; "
                              "0=disabled (default: 0).  When >0 a full diagnostic "
                              "of drone status/orders/merchants is printed at each "

@@ -317,7 +317,7 @@ class MOPSOCandidateGenerator(CandidateGenerator):
     """
     MOPSO-based candidate generation for U10.
 
-    Uses MOPSOPlanner from U11_mopso_dispatcher to generate candidate sets.
+    Uses MOPSOPlanner from U7_mopso_dispatcher to generate candidate sets.
     This is the UPPER LAYER that only generates candidates - it does NOT
     commit orders (READY -> ASSIGNED). The actual assignment is handled by
     the lower layer (rule selection via EventDrivenSingleUAVWrapper).
@@ -363,7 +363,7 @@ class MOPSOCandidateGenerator(CandidateGenerator):
 
         # Import MOPSOPlanner
         try:
-            from U11_mopso_dispatcher import MOPSOPlanner
+            from U11_mopso_dispatch import MOPSOPlanner
             self.planner = MOPSOPlanner(
                 n_particles=n_particles,
                 n_iterations=n_iterations,
@@ -374,8 +374,8 @@ class MOPSOCandidateGenerator(CandidateGenerator):
             )
         except ImportError as e:
             raise ImportError(
-                f"Failed to import MOPSOPlanner from U11_mopso_dispatcher: {e}. "
-                "Make sure U11_mopso_dispatcher.py is available."
+                f"Failed to import MOPSOPlanner from U7_mopso_dispatcher: {e}. "
+                "Make sure U7_mopso_dispatcher.py and U6_mopso_dispatcher.py are available."
             )
 
         # Fallback generator for padding

@@ -48,7 +48,6 @@ from U11_ablation import (
     _compute_completion_stats,
     print_env_tables,
     print_env_diagnostic,  # backward-compatible alias for print_env_tables
-    print_greedy_analysis,
     _run_diag_episode,
 )
 
@@ -123,7 +122,6 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
         print_env_diagnostic(env, step_label=f"rule={rule_id} seed={seed} start")
         rule_counter, reward_history, decision_count = _run_diag_episode(
             executor, env, args.max_steps, diag_interval, seed=None)
-        print_greedy_analysis(rule_counter, reward_history, decision_count)
     else:
         executor.run_episode(max_steps=args.max_steps, seed=seed)
 
@@ -192,7 +190,7 @@ def main():
                         help="Directory for trajectory plots (default: plots)")
     parser.add_argument("--plot-max-drones", type=int, default=20,
                         help="Maximum number of drone trajectories to render (default: 20)")
-    parser.add_argument("--diag-interval", type=int, default=0,
+    parser.add_argument("--diag-interval", type=int, default=1,
                         help="Print environment diagnostic every N decision steps; "
                              "0=disabled (default: 0).  Only meaningful for single-seed "
                              "single-rule runs (use with --rule-id and one seed).")
