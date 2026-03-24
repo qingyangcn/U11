@@ -127,20 +127,20 @@ def _table(title: str, headers: list, rows: list) -> None:
 def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
                      step_label: str = '',
                      max_orders: int = 30) -> None:
-    """Print four aligned ASCII tables summarising the current environment state.
+    """Print two aligned ASCII tables summarising the current environment state.
 
     Tables printed:
-    1. **Drone** — ID, status, position, destination, accepted order IDs, load, battery
-    2. **Order** — ID, status, merchant location, customer location, drone ID,
-                   pickup timestamp, delivery timestamp
-    3. **Customer** — customer index (per unique location), location, order ID
-    4. **Merchant** — ID, location, queue depth, pending order IDs
+    1. **Order** — 订单编号 商家编号 商家位置 备餐状态 顾客编号 顾客位置
+                   订单状态 分配无人机 取货时间步 配送时间步 完成/取消时间步
+    2. **Drone** — 时间步 无人机编号 无人机状态 当前位置 当前目的地
+                   已接订单列表 已取货订单 订单详情
 
     Args:
         env: The UAV environment (wrapped or raw).
         step_label: Optional extra label shown in the section header.
-        max_orders: Maximum number of active orders shown in the Order table
-                    (truncated to avoid overwhelming output).
+        max_orders: Maximum number of orders shown in the Order table
+                    (active orders first, then recently terminal ones,
+                    truncated to avoid overwhelming output).
     """
     raw = getattr(env, 'unwrapped', env)
     ts = raw.time_system
@@ -155,113 +155,153 @@ def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
           f"  active={len(raw.active_orders)}")
     print('=' * 80)
 
-    # ── 1. Drone table ────────────────────────────────────────────────────────
-    drone_rows = []
-    for did, drone in sorted(raw.drones.items()):
-        status_lbl = _DRONE_STATUS_LABEL.get(drone['status'],
-                                             str(drone['status'].value))
-        pos = _fmt_loc(drone.get('location'))
-        dest = _fmt_loc(drone.get('target_location'))
-        load = drone['current_load']
-        cap = drone['max_capacity']
-        battery = drone.get('battery_level', float('nan'))
-
-        # Accepted orders = cargo (picked up but not delivered) + planned deliveries
-        cargo: set = drone.get('cargo', set())
-        serving = drone.get('serving_order_id')
-        planned = [
-            s['order_id'] for s in drone.get('planned_stops', [])
-            if s.get('type') == 'D'
-        ] if drone.get('planned_stops') else []
-        accepted = sorted(
-            cargo
-            | ({serving} if serving is not None else set())
-            | set(planned)
-        )
-
-        drone_rows.append([
-            f"D{did:02d}",
-            status_lbl,
-            pos,
-            dest,
-            _fmt_ids(accepted),
-            f"{load}/{cap}",
-            f"{battery:.0f}%",
-        ])
-
-    _table(
-        "① Drone Status",
-        ["DroneID", "Status", "Position", "Destination", "Accepted Orders", "Load", "Battery"],
-        drone_rows,
-    )
-
-    # ── 2. Order table ────────────────────────────────────────────────────────
-    active_sorted = sorted(raw.active_orders)[:max_orders]
-    order_rows = []
-    for oid in active_sorted:
-        o = raw.orders.get(oid)
-        if o is None:
-            continue
-        status_name = o['status'].name if hasattr(o['status'], 'name') else str(o['status'])
-        merch_loc = _fmt_loc(o.get('merchant_location'))
-        cust_loc = _fmt_loc(o.get('customer_location'))
-        drone_id = o.get('assigned_drone', -1)
-        drone_str = f"D{drone_id:02d}" if drone_id >= 0 else '—'
-        pickup_t = o.get('pickup_time')
-        delivery_t = o.get('delivery_time')
-        order_rows.append([
-            f"#{oid}",
-            status_name,
-            merch_loc,
-            cust_loc,
-            drone_str,
-            str(pickup_t) if pickup_t is not None else '—',
-            str(delivery_t) if delivery_t is not None else '—',
-        ])
-    if len(raw.active_orders) > max_orders:
-        order_rows.append([
-            f"... +{len(raw.active_orders) - max_orders} more",
-            '', '', '', '', '', '',
-        ])
-
-    _table(
-        "② Order Status",
-        ["OrderID", "Status", "MerchantLoc", "CustomerLoc", "DroneID",
-         "PickupStep", "DeliveryStep"],
-        order_rows,
-    )
-
-    # ── 3. Customer table ─────────────────────────────────────────────────────
-    # Customers are identified by unique customer_location across active orders.
-    # We assign a stable customer index based on insertion order.
-    cust_map: dict = {}          # location_key -> (cust_idx, [order_ids])
+    # ── Build a stable customer-ID mapping from unique customer_location ──────
+    # Assign sequential C-indices in order-ID order so the table is reproducible.
+    cust_map: dict = {}   # location_key -> customer_index
     cust_idx_counter = 0
-    for oid in sorted(raw.active_orders):
+    for oid in sorted(raw.orders.keys()):
         o = raw.orders.get(oid)
         if o is None:
             continue
         cloc = o.get('customer_location')
         if cloc is None:
             continue
-        key = (cloc[0], cloc[1])  # use raw float tuple; customer_location is set once at order creation
+        key = (round(cloc[0], 3), round(cloc[1], 3))
         if key not in cust_map:
-            cust_map[key] = (cust_idx_counter, cloc, [])
+            cust_map[key] = cust_idx_counter
             cust_idx_counter += 1
-        cust_map[key][2].append(oid)
 
-    customer_rows = []
-    for key, (cidx, cloc, order_ids) in sorted(cust_map.items(),
-                                                key=lambda kv: kv[1][0]):
-        customer_rows.append([
-            f"C{cidx:03d}",
-            _fmt_loc(cloc),
-            _fmt_ids(order_ids),
+    def _cust_id(cloc) -> str:
+        if cloc is None:
+            return '—'
+        key = (round(cloc[0], 3), round(cloc[1], 3))
+        idx = cust_map.get(key)
+        return f"C{idx:03d}" if idx is not None else '—'
+
+    # ── 1. Order table ────────────────────────────────────────────────────────
+    # Show active orders first, then terminal (DELIVERED / CANCELLED) up to max_orders.
+    all_oids = sorted(raw.active_orders) + [
+        oid for oid in sorted(raw.orders.keys())
+        if oid not in raw.active_orders
+    ]
+    order_rows = []
+    for oid in all_oids[:max_orders]:
+        o = raw.orders.get(oid)
+        if o is None:
+            continue
+        status = o['status']
+        status_name = status.name if hasattr(status, 'name') else str(status)
+
+        # 备餐状态: ACCEPTED → "备餐中"; READY and beyond → "已备妥"
+        accepted_statuses = {OrderStatus.PENDING, OrderStatus.ACCEPTED}
+        prep_status = "备餐中" if status in accepted_statuses else "已备妥"
+
+        mid = o.get('merchant_id', '—')
+        merch_loc = _fmt_loc(o.get('merchant_location'))
+        cloc = o.get('customer_location')
+        cust_id_str = _cust_id(cloc)
+        cust_loc = _fmt_loc(cloc)
+
+        drone_id = o.get('assigned_drone', -1)
+        drone_str = f"D{drone_id:02d}" if drone_id is not None and drone_id >= 0 else '—'
+
+        pickup_t = o.get('pickup_time')
+        delivery_t = o.get('delivery_time')
+
+        # 完成/取消时间步
+        if status == OrderStatus.DELIVERED:
+            done_t = str(delivery_t) if delivery_t is not None else '—'
+        elif status == OrderStatus.CANCELLED:
+            ct = o.get('cancellation_time')
+            done_t = str(ct) if ct is not None else '—'
+        else:
+            done_t = '—'
+
+        order_rows.append([
+            f"#{oid}",
+            str(mid),
+            merch_loc,
+            prep_status,
+            cust_id_str,
+            cust_loc,
+            status_name,
+            drone_str,
+            str(pickup_t) if pickup_t is not None else '—',
+            str(delivery_t) if delivery_t is not None else '—',
+            done_t,
+        ])
+
+    total_orders = len(raw.orders)
+    if total_orders > max_orders:
+        order_rows.append([
+            f"... +{total_orders - max_orders} more",
+            '', '', '', '', '', '', '', '', '', '',
         ])
 
     _table(
-        "③ Customer Status",
-        ["CustID", "Location", "OrderIDs"],
-        customer_rows,
+        "① 订单状态 (Order Status)",
+        ["订单编号", "商家编号", "商家位置", "备餐状态",
+         "顾客编号", "顾客位置", "订单状态", "分配无人机",
+         "取货时间步", "配送时间步", "完成/取消时间步"],
+        order_rows,
+    )
+
+    # ── 2. Drone table ────────────────────────────────────────────────────────
+    drone_rows = []
+    for did, drone in sorted(raw.drones.items()):
+        status_lbl = _DRONE_STATUS_LABEL.get(drone['status'],
+                                             str(drone['status'].value))
+        pos = _fmt_loc(drone.get('location'))
+        dest = _fmt_loc(drone.get('target_location'))
+
+        # 已接订单列表: all orders the drone has accepted (ASSIGNED + planned D stops)
+        cargo: set = drone.get('cargo', set())
+        serving = drone.get('serving_order_id')
+        planned_d = [
+            s.get('order_id') for s in drone.get('planned_stops', [])
+            if s.get('type') == 'D' and s.get('order_id') is not None
+        ] if drone.get('planned_stops') else []
+        # ASSIGNED orders (in active_orders assigned to this drone, not yet picked up)
+        assigned_ids = sorted({
+            oid for oid in raw.active_orders
+            if raw.orders.get(oid, {}).get('assigned_drone') == did
+            and raw.orders[oid]['status'] == OrderStatus.ASSIGNED
+        })
+        all_accepted = sorted(
+            set(assigned_ids)
+            | ({serving} if serving is not None else set())
+            | set(planned_d)
+        )
+
+        # 已取货订单: orders currently in cargo (PICKED_UP)
+        picked_up = sorted(cargo)
+
+        # 订单详情: per-order status summary for all accepted orders
+        def _order_detail(oid) -> str:
+            o = raw.orders.get(oid)
+            if o is None:
+                return f"{oid}:?"
+            st = o['status'].name if hasattr(o['status'], 'name') else str(o['status'])
+            return f"{oid}:{st}"
+
+        details = ','.join(_order_detail(oid) for oid in all_accepted) or '—'
+
+        drone_rows.append([
+            str(step),
+            f"D{did:02d}",
+            status_lbl,
+            pos,
+            dest,
+            _fmt_ids(all_accepted),
+            _fmt_ids(picked_up),
+            details,
+        ])
+
+    _table(
+        "② 无人机状态 (Drone Status)",
+        ["时间步", "无人机编号", "无人机状态", "当前位置", "当前目的地",
+         "已接订单列表", "已取货订单", "订单详情"],
+        drone_rows,
     )
 
 

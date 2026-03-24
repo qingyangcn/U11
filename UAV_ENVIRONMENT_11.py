@@ -2951,7 +2951,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._update_merchant_preparation()
         # Split each RL step into physics_substeps micro-steps so that drones
         # cannot silently traverse multiple waypoints within a single observation
-        # frame.  Total movement and energy per RL step are unchanged.
+        # frame.  Conservation invariants (per RL step):
+        #   - total movement  = N × (speed/N)      = speed       ✓
+        #   - total energy    ∝ total distance                    ✓
+        #   - total charging  = N × (rate/N)        = rate        ✓
         substep_scale = 1.0 / self.physics_substeps
         for _ in range(self.physics_substeps):
             self._update_drone_positions(speed_scale=substep_scale)
