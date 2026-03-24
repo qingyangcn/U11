@@ -20,7 +20,6 @@ ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at t
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
 
 # ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
-FIXED_SPEED_MULTIPLIER = 1.0  # Fixed speed multiplier for all drones
 
 
 def set_global_seed(seed):
@@ -2677,7 +2676,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone = self.drones[drone_id]
 
             # Store fixed speed multiplier (used in movement)
-            drone['ppo_speed_multiplier'] = FIXED_SPEED_MULTIPLIER
+            drone['ppo_speed_multiplier'] = drone['speed']
 
             # STRICT: Only process rule if drone was at decision point BEFORE action
             # Use cached decision points, not real-time check
@@ -2837,12 +2836,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # duplicate cost penalties and unit inconsistency with the actual energy model.
             # Cost penalties are already applied in _calculate_three_objective_rewards
             # using actual delta_distance and delta_energy (step increments).
-            #
-            # Previous code (removed to fix reward scaling inconsistency):
-            # speed = float(drone['speed']) * float(self._get_weather_speed_factor())
-            # r[1] -= self.shaping_distance_k * speed
-            # battery_consumption = float(drone["battery_consumption_rate"]) * float(self._get_weather_battery_factor())
-            # r[1] -= self.shaping_energy_k * battery_consumption
+
 
             # Update prev_dist for next step
             self._prev_target_dist[d] = new_dist
@@ -3386,7 +3380,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if speed <= 1e-6:
                     continue
 
-                # U8: Use fixed speed multiplier (stored in drone during action processing)
                 # Default to 1.0 if not set yet
                 speed_multiplier = drone.get('ppo_speed_multiplier', 1.0)
 
