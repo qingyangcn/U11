@@ -31,14 +31,15 @@ import csv
 import math
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
+from typing import Optional
 
 import numpy as np
 
 # Add repo root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
+from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv, DroneStatus, OrderStatus
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 
 try:
@@ -53,6 +54,253 @@ try:
     _HAS_MOPSO = True
 except ImportError:
     _HAS_MOPSO = False
+
+
+# ---------------------------------------------------------------------------
+# Environment diagnostic helpers
+# ---------------------------------------------------------------------------
+
+_STATUS_ABBR = {
+    DroneStatus.IDLE: 'IDLE',
+    DroneStatus.ASSIGNED: 'ASGN',
+    DroneStatus.FLYING_TO_MERCHANT: 'FLY→M',
+    DroneStatus.WAITING_FOR_PICKUP: 'WAIT',
+    DroneStatus.FLYING_TO_CUSTOMER: 'FLY→C',
+    DroneStatus.DELIVERING: 'DLVR',
+    DroneStatus.RETURNING_TO_BASE: 'RTB',
+    DroneStatus.CHARGING: 'CHRG',
+}
+
+
+def print_env_diagnostic(env: ThreeObjectiveDroneDeliveryEnv,
+                         step_label: str = '',
+                         show_orders: bool = True,
+                         show_merchants: bool = True) -> None:
+    """Print a concise snapshot of environment state for debugging.
+
+    Prints:
+    * Per-drone: status, serving order, load, cargo, planned-stop count,
+      current location, target location.
+    * Order status breakdown (counts and active READY/ASSIGNED ids).
+    * Merchant queue summary (pending orders queued at each merchant).
+    * Daily stats snapshot.
+
+    Args:
+        env: The UAV environment (may be wrapped; uses env.unwrapped internally).
+        step_label: Optional label prepended to the header line.
+        show_orders: Whether to print the order status section.
+        show_merchants: Whether to print the merchant queue section.
+    """
+    raw = getattr(env, 'unwrapped', env)
+    ts = raw.time_system
+    step = ts.current_step
+    header = f"[Diag step={step} hour={ts.current_hour:.1f}{' | ' + step_label if step_label else ''}]"
+    print("─" * 70)
+    print(header)
+
+    # ── Drone table ──────────────────────────────────────────────────────────
+    print("  Drones:")
+    for did, drone in sorted(raw.drones.items()):
+        status_str = _STATUS_ABBR.get(drone['status'], str(drone['status'].value))
+        load = drone['current_load']
+        cap = drone['max_capacity']
+        serving = drone.get('serving_order_id')
+        cargo = drone.get('cargo', set())
+        n_stops = len(drone.get('planned_stops', []))
+        loc = drone.get('location')
+        tgt = drone.get('target_location')
+
+        loc_str = f"({loc[0]:.1f},{loc[1]:.1f})" if loc is not None else "?"
+        tgt_str = f"→({tgt[0]:.1f},{tgt[1]:.1f})" if tgt is not None else ""
+        cargo_str = f" cargo={sorted(cargo)}" if cargo else ""
+        serving_str = f" srv=#{serving}" if serving is not None else ""
+        stops_str = f" stops={n_stops}" if n_stops else ""
+        print(f"    D{did:02d}: {status_str:<7} load={load}/{cap}"
+              f"{serving_str}{cargo_str}{stops_str}"
+              f"  pos={loc_str}{tgt_str}")
+
+    # ── Order status breakdown ────────────────────────────────────────────────
+    if show_orders:
+        status_counts: dict = defaultdict(int)
+        status_ids: dict = defaultdict(list)
+        for oid in raw.active_orders:
+            o = raw.orders[oid]
+            s = o['status']
+            status_counts[s] += 1
+            if s in (OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
+                status_ids[s].append(oid)
+
+        gen = raw.daily_stats['orders_generated']
+        done = raw.daily_stats['orders_completed']
+        cxl = raw.daily_stats.get('orders_cancelled', 0)
+        pending_active = len(raw.active_orders)
+
+        parts = []
+        for st in (OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP,
+                   OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.PREPARING):
+            if status_counts[st]:
+                parts.append(f"{st.name}={status_counts[st]}")
+        parts_str = '  '.join(parts) if parts else 'none'
+        print(f"  Orders: active={pending_active}  {parts_str}"
+              f"  | generated={gen}  completed={done}  cancelled={cxl}")
+
+        ready_ids = status_ids[OrderStatus.READY]
+        if ready_ids:
+            preview = ready_ids[:8]
+            more = f" …+{len(ready_ids)-8}" if len(ready_ids) > 8 else ""
+            print(f"    READY ids : {preview}{more}")
+        assigned_ids = status_ids[OrderStatus.ASSIGNED]
+        if assigned_ids:
+            print(f"    ASSIGNED  : {assigned_ids[:8]}")
+        picked_ids = status_ids[OrderStatus.PICKED_UP]
+        if picked_ids:
+            print(f"    PICKED_UP : {picked_ids[:8]}")
+
+    # ── Merchant queues ───────────────────────────────────────────────────────
+    if show_merchants:
+        busy_merchants = {mid: len(m['queue'])
+                          for mid, m in raw.merchants.items()
+                          if len(m['queue']) > 0}
+        if busy_merchants:
+            items = sorted(busy_merchants.items(), key=lambda kv: -kv[1])
+            summary = '  '.join(f"M{mid}(q={q})" for mid, q in items[:10])
+            print(f"  Merchants with queue: {summary}")
+        else:
+            print("  Merchants: all queues empty")
+
+
+def print_greedy_analysis(rule_counter: Counter, reward_history: list,
+                          decision_count: int) -> None:
+    """Analyse whether decision patterns suggest greedy or return-optimising behaviour.
+
+    Prints:
+    * Rule selection distribution.
+    * Per-step reward statistics.
+    * Qualitative verdict on greedy vs return-optimising behaviour.
+
+    Args:
+        rule_counter: Counter mapping rule_id → number of times selected.
+        reward_history: List of scalar rewards received at each env step.
+        decision_count: Total number of decision calls made.
+    """
+    print("\n" + "=" * 70)
+    print("Decision-Pattern Analysis: Greedy vs. Return-Optimisation")
+    print("=" * 70)
+
+    # Rule distribution
+    total = sum(rule_counter.values())
+    if total > 0:
+        print("  Rule selection distribution:")
+        rule_names = {
+            0: "default/highest-priority",
+            1: "alt-rule-1",
+            2: "EDF (earliest deadline)",
+            3: "nearest pickup",
+            4: "slack-per-distance",
+        }
+        for rid in sorted(rule_counter):
+            cnt = rule_counter[rid]
+            pct = 100.0 * cnt / total
+            print(f"    Rule {rid} ({rule_names.get(rid, '?'):28s}): "
+                  f"{cnt:5d} ({pct:5.1f}%)")
+    else:
+        print("  No rule selections recorded.")
+
+    # Reward statistics
+    if reward_history:
+        arr = np.array(reward_history, dtype=np.float64)
+        nonzero = arr[arr != 0]
+        print(f"\n  Reward statistics (all {len(arr)} steps):")
+        print(f"    mean={arr.mean():.4f}  std={arr.std():.4f}  "
+              f"min={arr.min():.4f}  max={arr.max():.4f}")
+        print(f"    non-zero steps: {len(nonzero)} / {len(arr)}"
+              f"  ({100*len(nonzero)/max(1,len(arr)):.1f}%)")
+        if len(nonzero):
+            print(f"    non-zero mean={nonzero.mean():.4f}  "
+                  f"non-zero std={nonzero.std():.4f}")
+        # Cumulative return over time (plot a coarse view)
+        cum = np.cumsum(arr)
+        n_seg = min(10, len(cum))
+        seg_size = max(1, len(cum) // n_seg)
+        cum_samples = [float(cum[min(i * seg_size, len(cum) - 1)])
+                       for i in range(1, n_seg + 1)]
+        print(f"    cumulative return (coarse): "
+              + "  ".join(f"{v:.1f}" for v in cum_samples))
+
+    # Verdict
+    print("\n  ── Verdict ──")
+    dominant_rule = rule_counter.most_common(1)[0][0] if rule_counter else -1
+    dominant_pct = (100.0 * rule_counter[dominant_rule] / max(1, total)
+                    if rule_counter else 0.0)
+    if dominant_pct > 90:
+        if dominant_rule == 3:
+            print("  ⚠  Rule 3 (nearest pickup) was used >90% of the time.")
+            print("     This is *greedy* behaviour: the agent always picks the")
+            print("     closest order rather than planning long-term routes.")
+            print("     If this is the trained PPO policy, the policy has collapsed")
+            print("     to a greedy heuristic and is NOT maximising cumulative return.")
+        else:
+            print(f"  ⚠  A single rule ({dominant_rule}) dominates ({dominant_pct:.1f}%).")
+            print("     The policy may have collapsed to a greedy heuristic.")
+    elif total == 0:
+        print("  ℹ  No decisions recorded — check executor configuration.")
+    else:
+        print("  ✓  Multiple rules used. Policy appears to vary its decisions,")
+        print("     which is consistent with return-optimising (non-greedy) behaviour.")
+        print("     NOTE: PPO with gamma=0.99 and GAE(lambda=0.95) maximises")
+        print("     G_t = Σ γᵏ·r_{t+k}  (discounted cumulative return),")
+        print("     NOT the greedy immediate reward.  Training is meaningful.")
+    print("=" * 70)
+
+
+def _run_diag_episode(executor: DecentralizedEventDrivenExecutor,
+                      env: ThreeObjectiveDroneDeliveryEnv,
+                      max_steps: int,
+                      diag_interval: int,
+                      seed: Optional[int] = None) -> tuple:
+    """Run an episode with periodic diagnostic prints.
+
+    Returns:
+        (rule_counter, reward_history, decision_count)
+    """
+    raw = getattr(env, 'unwrapped', env)
+    if seed is not None:
+        import random as _rnd
+        np.random.seed(seed)
+        _rnd.seed(seed)
+        obs, info = executor.reset(seed=seed)
+    else:
+        obs, info = executor.reset()
+
+    rule_counter: Counter = Counter()
+    reward_history: list = []
+    decision_count = 0
+
+    for step_num in range(max_steps):
+        decision_drones = raw.get_decision_drones()
+        if decision_drones:
+            decision_count += len(decision_drones)
+            # Track which rules were chosen
+            for did in decision_drones:
+                local_obs = executor._extract_local_observation(
+                    executor._get_current_observation(), did)
+                chosen = executor.policy_fn(local_obs)
+                rule_counter[chosen] += 1
+
+        obs, reward, terminated, truncated, info = executor.step()
+        reward_history.append(float(reward))
+
+        if diag_interval > 0 and (step_num + 1) % diag_interval == 0:
+            print_env_diagnostic(env, step_label=f"decision_step={step_num+1}")
+
+        if terminated or truncated:
+            break
+
+    # Final snapshot
+    if diag_interval > 0:
+        print_env_diagnostic(env, step_label="episode-end")
+
+    return rule_counter, reward_history, decision_count
 
 
 def random_policy(local_obs: dict) -> int:
@@ -515,6 +763,8 @@ def run_sanity_check(args):
     print("U11 Decentralized Execution Sanity Check")
     print("=" * 80)
 
+    diag_interval: int = getattr(args, 'diag_interval', 0)
+
     # Create environment
     print("\nCreating environment...")
     env = _make_env(args, order_cutoff_steps=args.order_cutoff_steps)
@@ -536,7 +786,7 @@ def run_sanity_check(args):
             print(f"  Warning: MOPSO unavailable, using built-in candidates.")
 
     # Choose policy
-    if args.model_path:
+    if args.model_path and os.path.exists(args.model_path):
         print(f"\nLoading trained policy from: {args.model_path}")
         policy_fn = load_trained_policy(args.model_path, args.vecnormalize_path)
         policy_name = "Trained Policy"
@@ -554,9 +804,27 @@ def run_sanity_check(args):
         verbose=args.verbose,
     )
 
-    # Run episode
+    if diag_interval > 0:
+        # Print initial state
+        obs, info = executor.reset(seed=args.seed)
+        print_env_diagnostic(env, step_label="episode-start")
 
-    stats = executor.run_episode(max_steps=args.max_steps)
+        rule_counter, reward_history, decision_count = _run_diag_episode(
+            executor, env, args.max_steps, diag_interval, seed=None)  # already reset above
+
+        # Print summary stats
+        stats = _compute_completion_stats(env, executor)
+        print(f"\nEpisode summary: "
+              f"GC={stats['general_completion']:.4f}  "
+              f"generated={stats['generated_total']}  "
+              f"completed={stats['completed_total']}  "
+              f"reward={stats['cumulative_reward']:.2f}  "
+              f"energy_pc={stats['energy_per_completed']:.3f}  "
+              f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}")
+
+        print_greedy_analysis(rule_counter, reward_history, decision_count)
+    else:
+        executor.run_episode(max_steps=args.max_steps, seed=args.seed)
 
 
 def main():
@@ -624,6 +892,12 @@ def main():
     parser.add_argument("--track-action-stats", action="store_true", default=True,
                         help="Track and print rule selection distribution after each episode "
                              "(default: False)")
+    parser.add_argument("--diag-interval", type=int, default=0,
+                        help="Print environment diagnostic every N decision steps; "
+                             "0=disabled (default: 0).  When >0 a full diagnostic "
+                             "of drone status/orders/merchants is printed at each "
+                             "interval and a greedy-vs-return analysis is shown at "
+                             "episode end.  Useful for single-episode sanity checks.")
 
     args = parser.parse_args()
 
