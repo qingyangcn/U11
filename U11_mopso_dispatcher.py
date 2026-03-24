@@ -1,5 +1,5 @@
 """
-U7 MOPSO Dispatcher – Multi-Objective PSO Order-to-Drone Batch Assignment
+U11 MOPSO Dispatcher – Multi-Objective PSO Order-to-Drone Batch Assignment
 
 This module implements the TASK LAYER of the hierarchical UAV delivery system.
 Responsibility: order → drone assignment (READY → ASSIGNED, multiple orders per drone).
