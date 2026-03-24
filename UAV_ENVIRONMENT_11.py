@@ -1975,11 +1975,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         _t1 = time.perf_counter() if _profile else 0.0
         self._update_candidate_mappings()
 
-        # U9: Update filtered candidates based on interval
+        # U9: Update filtered candidates + MOPSO batch assignment based on interval
         _t2 = time.perf_counter() if _profile else 0.0
+        should_run_mopso = False
         if self.candidate_update_interval > 0:
             if self.time_system.current_step % self.candidate_update_interval == 0:
-                self.update_filtered_candidates()
+                should_run_mopso = True
+        # Also trigger MOPSO when any IDLE drone has no assigned orders and
+        # there are READY orders available (ensures drones never starve for work).
+        if not should_run_mopso and self._ready_orders_cache:
+            for _d_id, _d in self.drones.items():
+                if (_d['status'] == DroneStatus.IDLE and
+                        _d.get('current_load', 0) == 0 and
+                        _d.get('serving_order_id') is None):
+                    should_run_mopso = True
+                    break
+        if should_run_mopso:
+            self.update_filtered_candidates()
 
         # Cache decision points BEFORE processing action (for consistent diagnostics)
         self._last_decision_points_mask = [
@@ -2485,11 +2497,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         cargo = drone.get('cargo', set())
 
         if not cargo:
-            # No cargo - fall back to assigned orders, then ready orders
-            result = self._rule_assigned_edf(drone_id)
-            if result is not None:
-                return result
-            return self._rule_ready_edf(drone_id)
+            # No cargo - fall back to assigned orders only.
+            # MOPSO handles READY→ASSIGNED batch assignment; RL does not select READY orders.
+            return self._rule_assigned_edf(drone_id)
 
         # Select from cargo: prefer earliest deadline
         best_order_id = None
@@ -2538,38 +2548,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return best_order_id
 
     def _rule_ready_edf(self, drone_id: int) -> Optional[int]:
-        """Rule 2: READY_EDF - Earliest deadline first from ready unassigned orders."""
-        drone = self.drones[drone_id]
+        """Rule 2: EDF (Earliest Deadline First) across all candidate orders.
 
-        # Check capacity
-        if drone['current_load'] >= drone['max_capacity']:
-            return None
-
-        best_order_id = None
-        best_deadline = float('inf')
-
-        # U9: Apply candidate filtering
-        candidate_constrained_orders = self._get_candidate_constrained_orders(
-            drone_id, list(self.active_orders)
-        )
-
-        for order_id in candidate_constrained_orders:
-            if order_id not in self.orders:
-                continue
-            order = self.orders[order_id]
-
-            # Only consider READY unassigned orders
-            if order['status'] != OrderStatus.READY:
-                continue
-            if order.get('assigned_drone', -1) not in (-1, None):
-                continue
-
-            deadline = self._get_delivery_deadline_step(order)
-            if deadline < best_deadline:
-                best_deadline = deadline
-                best_order_id = order_id
-
-        return best_order_id
+        With MOPSO batch assignment, READY orders in the candidate set are
+        immediately committed as ASSIGNED.  This rule therefore considers
+        ASSIGNED orders for this drone first (EDF), then PICKED_UP orders as
+        a tiebreaker.  It remains a distinct rule from ASSIGNED_EDF (Rule 1)
+        because it gives RL a second EDF signal that can be useful when the
+        policy needs to differentiate between rules.
+        """
+        # Delegate to ASSIGNED_EDF – since MOPSO pre-assigns all candidates,
+        # READY unassigned orders should no longer appear in the candidate set
+        # for this drone.  If they do (e.g. no generator set, fallback active),
+        # ASSIGNED_EDF still makes a sensible choice.
+        return self._rule_assigned_edf(drone_id)
 
     def _rule_nearest_pickup(self, drone_id: int) -> Optional[int]:
         """Rule 3: NEAREST_PICKUP - Closest pickup location from available orders."""
@@ -2738,32 +2730,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             prev_status = drone['status']
             prev_load = drone['current_load']
 
-            # Handle READY orders - assign them first
+            # MOPSO handles READY→ASSIGNED via batch assignment (task layer).
+            # RL only routes drones to already-ASSIGNED or PICKED_UP orders.
             if order['status'] == OrderStatus.READY:
-                # Rule selected a READY order -> try to assign it to this drone
-                if order.get('assigned_drone', -1) in (-1, None):
-                    if drone['current_load'] < drone['max_capacity']:
-                        prev_order_status = order['status']
-
-                        # Assign the order using the standard assignment mechanism
-                        self._process_single_assignment(drone_id, order_id, allow_busy=True)
-
-                        # Check if assignment actually happened (state changed)
-                        # State change indicators for READY->ASSIGNED:
-                        # 1. Order status changed to ASSIGNED
-                        # 2. Order's assigned_drone is now this drone
-                        # 3. Drone's current_load increased
-                        new_order_status = order['status']
-                        new_assigned_drone = order.get('assigned_drone', -1)
-                        new_load = drone['current_load']
-
-                        # State changed if order is now assigned to this drone and either:
-                        # - Load increased (order added to drone's capacity)
-                        # - Status changed from READY to ASSIGNED
-                        if (new_order_status == OrderStatus.ASSIGNED and
-                                new_assigned_drone == drone_id and
-                                new_load > prev_load):
-                            state_changed = True
+                continue
 
             # Always set serving_order_id to track which order drone is executing
             # This maintains correct drone state regardless of whether it's counted as "applied"
@@ -5089,7 +5059,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._filtered_candidates_sets = {}
             return
 
-        # Generate candidates using the external generator
+        # Generate candidates using the external generator (MOPSO task layer)
         self.filtered_candidates = self.candidate_generator.generate_candidates(self)
         # Build cached set version for O(1) membership tests in _get_candidate_constrained_orders
         self._filtered_candidates_sets = {
@@ -5098,6 +5068,49 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         }
         # Caches are now fresh; clear the dirty flag.
         self._candidate_mappings_dirty = False
+
+        # MOPSO BATCH ASSIGNMENT: commit all MOPSO-suggested READY orders as actual
+        # READY→ASSIGNED assignments so that RL only handles routing (motion layer).
+        self._apply_mopso_batch_assignment()
+
+    def _apply_mopso_batch_assignment(self) -> None:
+        """
+        Commit MOPSO-suggested candidate orders as actual READY→ASSIGNED assignments.
+
+        This is the task-layer assignment step.  Called immediately after
+        ``update_filtered_candidates()`` so that MOPSO (or its heuristic fallback)
+        is the SOLE authority for order→drone assignment.  The RL motion layer
+        only needs to select which already-ASSIGNED order to route to next.
+
+        Design notes:
+        - Assigns up to ``drone['max_capacity'] - drone['current_load']`` orders
+          per drone (respects capacity).
+        - Processes drones in ascending drone_id order; if the same order appears
+          in multiple drones' candidate lists the first drone wins.
+        - Orders that are no longer READY (cancelled, expired, already assigned
+          by a preceding drone) are silently skipped.
+        """
+        if not self.filtered_candidates:
+            return
+
+        for drone_id in range(self.num_drones):
+            if drone_id not in self.drones:
+                continue
+            drone = self.drones[drone_id]
+            order_ids = self.filtered_candidates.get(drone_id, [])
+            for order_id in order_ids:
+                if order_id < 0 or order_id not in self.orders:
+                    continue
+                order = self.orders[order_id]
+                # Only assign READY, genuinely unassigned orders
+                if order['status'] != OrderStatus.READY:
+                    continue
+                if order.get('assigned_drone', -1) not in (-1, None):
+                    continue  # Already claimed by another drone
+                if drone['current_load'] >= drone['max_capacity']:
+                    break  # Drone is full; no point checking more orders
+                # Commit the assignment (READY → ASSIGNED)
+                self._process_single_assignment(drone_id, order_id, allow_busy=True)
 
     def get_filtered_candidates_for_drone(self, drone_id: int) -> List[int]:
         """
@@ -5133,14 +5146,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 return order_ids
             return []
 
-        return [oid for oid in order_ids if oid in candidate_set and self._is_candidate_selectable(oid)]
+        return [oid for oid in order_ids if oid in candidate_set and self._is_candidate_selectable(oid, drone_id)]
 
-    def _is_candidate_selectable(self, order_id: int) -> bool:
+    def _is_candidate_selectable(self, order_id: int, requesting_drone_id: int = -1) -> bool:
         """Final dirty check: ensure an order in the candidate set is still selectable.
 
         Guards against stale candidate entries when the order was cancelled,
         delivered, or assigned to another drone between candidate refreshes.
         A READY order must also be genuinely unassigned.
+
+        Args:
+            order_id: The order to check.
+            requesting_drone_id: The drone that wants to select this order.
+                If provided (>= 0), ASSIGNED/PICKED_UP orders belonging to
+                this drone are always considered selectable (e.g. right after a
+                MOPSO batch assignment while the drone is still IDLE).
         """
         order = self.orders.get(order_id)
         if order is None:
@@ -5149,13 +5169,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if status == OrderStatus.READY:
             # Must be genuinely unassigned (no drone has claimed it yet)
             return order.get('assigned_drone', -1) in (-1, None)
-        # ASSIGNED and PICKED_UP orders remain selectable only when their drone
-        # is actively working (not IDLE/CHARGING which indicates a stale reference).
         if status in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
-            drone_id = order.get('assigned_drone', -1)
-            if drone_id < 0 or drone_id not in self.drones:
+            assigned_drone = order.get('assigned_drone', -1)
+            if assigned_drone < 0 or assigned_drone not in self.drones:
                 return False
-            return self.drones[drone_id]['status'] not in (DroneStatus.IDLE, DroneStatus.CHARGING)
+            # An order assigned to the requesting drone is always selectable.
+            # This covers the MOPSO batch-assignment case where a drone is still
+            # IDLE but has just received one or more ASSIGNED orders.
+            if requesting_drone_id >= 0 and assigned_drone == requesting_drone_id:
+                return True
+            # For orders assigned to OTHER drones: only selectable while that
+            # drone is actively working (stale-reference guard).
+            return self.drones[assigned_drone]['status'] not in (DroneStatus.IDLE, DroneStatus.CHARGING)
         return False
 
     # ================ U9: Event-driven single UAV decision support ================
@@ -5230,32 +5255,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         prev_status = drone['status']
         prev_load = drone['current_load']
 
-        # Handle READY orders - assign them first
+        # MOPSO handles READY→ASSIGNED via batch assignment (task layer).
+        # RL only routes drones to already-ASSIGNED or PICKED_UP orders.
         if order['status'] == OrderStatus.READY:
-            if order.get('assigned_drone', -1) in (-1, None):
-                if drone['current_load'] < drone['max_capacity']:
-                    # Assign the order
-                    self._process_single_assignment(drone_id, order_id, allow_busy=True)
+            self.last_decision_info['failure_reason'] = 'ready_order_reserved_for_mopso'
+            return False
 
-                    # Check if assignment happened
-                    new_order_status = order['status']
-                    new_assigned_drone = order.get('assigned_drone', -1)
-                    new_load = drone['current_load']
-
-                    if (new_order_status == OrderStatus.ASSIGNED and
-                            new_assigned_drone == drone_id and
-                            new_load > prev_load):
-                        state_changed = True
-                    else:
-                        self.last_decision_info['failure_reason'] = 'assignment_rejected'
-                else:
-                    self.last_decision_info['failure_reason'] = 'drone_at_capacity'
-            else:
-                self.last_decision_info['failure_reason'] = 'order_already_assigned'
-        else:
-            # Order not READY - might be ASSIGNED or PICKED_UP by this drone
-            if order.get('assigned_drone', -1) != drone_id:
-                self.last_decision_info['failure_reason'] = 'order_not_ready_or_not_mine'
+        # Order is ASSIGNED or PICKED_UP – verify it belongs to this drone
+        if order.get('assigned_drone', -1) != drone_id:
+            self.last_decision_info['failure_reason'] = 'order_not_assigned_to_this_drone'
+            # Don't return False yet; let target-setting proceed if serving logic needs it
+            # but mark as failure so the caller knows
 
         # Set serving_order_id and target
         drone['serving_order_id'] = order_id
