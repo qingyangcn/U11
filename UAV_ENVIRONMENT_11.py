@@ -147,8 +147,6 @@ class StateManager:
         self.env = env
         # Bounded deque to prevent unbounded GC pressure over long training runs
         self.state_log = deque(maxlen=5000)
-        # First-anomaly snapshot: printed once to help diagnose index/status skew
-        self._first_anomaly_logged = False
 
     def update_order_status(self, order_id, new_status, reason=""):
         """统一更新订单状态"""
@@ -231,26 +229,6 @@ class StateManager:
         drone = self.env.drones[drone_id]
         old_status = drone['status']
 
-        # Guard: refuse IDLE transition when the drone still holds PICKED_UP/in-progress orders.
-        # This prevents the PICKED_UP + IDLE state-consistency anomaly.
-        if new_status == DroneStatus.IDLE:
-            serving_order_id = drone.get('serving_order_id')
-            if serving_order_id is not None and serving_order_id in self.env.orders:
-                order = self.env.orders[serving_order_id]
-                if order['status'] == OrderStatus.PICKED_UP:
-                    print(
-                        f"[GUARD] Refusing IDLE transition for drone {drone_id}: "
-                        f"still holds PICKED_UP serving_order {serving_order_id}"
-                    )
-                    return False
-            for oid in list(drone.get('cargo', set())):
-                if oid in self.env.orders and self.env.orders[oid]['status'] == OrderStatus.PICKED_UP:
-                    print(
-                        f"[GUARD] Refusing IDLE transition for drone {drone_id}: "
-                        f"cargo contains PICKED_UP order {oid}"
-                    )
-                    return False
-
         drone['status'] = new_status
 
         if target_location is not None:
@@ -296,150 +274,6 @@ class StateManager:
 
         return categories
 
-    def get_state_consistency_check(self):
-        """检查状态一致性 (Route-aware for Task B, Task-selection aware for U7)"""
-        issues = []
-        first_anomaly_order_id = None  # tracks the order_id of the first issue found
-
-        # 检查订单与无人机状态一致性
-        for order_id, order in self.env.orders.items():
-            issues_before = len(issues)
-            drone_id = order.get('assigned_drone')
-            if drone_id is not None and drone_id >= 0:
-                if drone_id not in self.env.drones:
-                    issues.append(f"订单 {order_id} 分配的无人机 {drone_id} 不存在")
-                    continue
-
-                drone = self.env.drones[drone_id]
-                planned_stops = drone.get('planned_stops', [])
-                serving_order_id = drone.get('serving_order_id')
-
-                # Route-aware check: when drone has planned_stops, use route logic
-                if planned_stops and len(planned_stops) > 0:
-                    # For route-plan mode, check if order is in the route
-                    order_in_route = self._order_in_planned_stops(order_id, planned_stops)
-                    order_in_cargo = order_id in drone.get('cargo', set())
-
-                    if order['status'] == OrderStatus.ASSIGNED:
-                        # ASSIGNED order should be in route or about to be picked up
-                        if not order_in_route:
-                            issues.append(f"[Route] 订单 {order_id} 已分配但不在无人机 {drone_id} 的路线中")
-
-                    elif order['status'] == OrderStatus.PICKED_UP:
-                        # PICKED_UP order consistency checks (route-aware)
-                        has_delivery_stop = self._has_delivery_stop(order_id, planned_stops)
-
-                        if len(planned_stops) > 0 and has_delivery_stop:
-                            # Drone has active route with D stop for this order
-                            if not order_in_cargo:
-                                # This is a real inconsistency - order should be in cargo
-                                issues.append(f"[Route] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物集合中")
-                        elif len(planned_stops) > 0 and order_in_cargo and not has_delivery_stop:
-                            # Order in cargo but no D stop - missing delivery stop
-                            issues.append(f"[Route] 订单 {order_id} 已取货但缺少对应的 D stop")
-                        # If planned_stops is empty or no D stop and not in cargo,
-                        # drone is likely completing/resetting - this is OK
-
-                # Task-selection mode check: when drone has serving_order_id but no planned_stops
-                elif serving_order_id is not None:
-                    # Validate serving order consistency
-                    if order_id == serving_order_id:
-                        # This is the order being served - validate status vs drone status
-                        if order['status'] == OrderStatus.ASSIGNED:
-                            # Should be going to merchant
-                            if drone['status'] not in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
-                                issues.append(
-                                    f"[TaskSel] 订单 {order_id} 为 serving_order (ASSIGNED) 但无人机 {drone_id} 状态不匹配: {drone['status']}"
-                                )
-                        elif order['status'] == OrderStatus.PICKED_UP:
-                            # Should be in cargo and going to customer
-                            if order_id not in drone.get('cargo', set()):
-                                issues.append(
-                                    f"[TaskSel] 订单 {order_id} 为 serving_order (PICKED_UP) 但不在无人机 {drone_id} 的货物中"
-                                )
-                            if drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
-                                issues.append(
-                                    f"[TaskSel] 订单 {order_id} 为 serving_order (PICKED_UP) 但无人机 {drone_id} 状态不匹配: {drone['status']}"
-                                )
-                    else:
-                        # This is NOT the serving order, but assigned to this drone
-                        # In task-selection mode, it's OK to have other assigned orders that are not being served yet
-                        # Only check cargo invariants
-                        if order['status'] == OrderStatus.PICKED_UP:
-                            if order_id not in drone.get('cargo', set()):
-                                issues.append(
-                                    f"[TaskSel] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物中"
-                                )
-
-                else:
-                    # Legacy mode: original consistency check (no planned_stops and no serving_order_id)
-                    # Allow more flexibility to avoid false positives
-                    if order['status'] == OrderStatus.ASSIGNED:
-                        # Only flag if drone is in a clearly wrong state (IDLE/CHARGING with assigned orders is OK)
-                        if drone['status'] in [DroneStatus.RETURNING_TO_BASE]:
-                            issues.append(
-                                f"[Invariant] 订单 {order_id} 已分配但无人机 {drone_id} 正在返航: {drone['status']}")
-
-                    elif order['status'] == OrderStatus.PICKED_UP:
-                        # PICKED_UP orders should be in cargo (check cargo invariant)
-                        if order_id not in drone.get('cargo', set()):
-                            issues.append(f"[Invariant] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物中")
-                        if drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER,
-                                                   DroneStatus.FLYING_TO_MERCHANT]:
-                            issues.append(
-                                f"[Invariant] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
-
-            # Track the first order that triggered any new issues
-            if first_anomaly_order_id is None and len(issues) > issues_before:
-                first_anomaly_order_id = order_id
-
-        # First-anomaly snapshot: log detailed index state on the first issue ever found
-        if issues and first_anomaly_order_id is not None and not self._first_anomaly_logged:
-            self._log_first_anomaly_snapshot(first_anomaly_order_id, issues)
-
-        return issues
-
-    def _log_first_anomaly_snapshot(self, order_id: int, issues: list):
-        """Print a one-time diagnostic snapshot the first time a consistency issue
-        is detected.  Records the full index/cache membership so it is easy to
-        tell whether 'status changed but index not updated' or 'double-transition'.
-        """
-        if self._first_anomaly_logged:
-            return
-        self._first_anomaly_logged = True
-
-        env = self.env
-        step = env.time_system.current_step
-        order = env.orders.get(order_id, {})
-        drone_id = order.get('assigned_drone', -1)
-        drone = env.drones.get(drone_id, {}) if drone_id is not None and drone_id >= 0 else {}
-
-        # Which drones' candidate mappings contain this order?
-        in_candidate_drones = [
-            d for d, mapping in env.drone_candidate_mappings.items()
-            if any(oid == order_id for oid, _ in mapping)
-        ]
-        in_filtered_drones = [
-            d for d, s in env._filtered_candidates_sets.items()
-            if order_id in s
-        ]
-
-        print(f"\n{'='*70}")
-        print(f"[ANOMALY SNAPSHOT] first consistency issue at step {step}")
-        print(f"  order_id       : {order_id}")
-        print(f"  order.status   : {order.get('status')}")
-        print(f"  in active_orders: {order_id in env.active_orders}")
-        print(f"  in _ready_orders_cache: {order_id in env._ready_orders_cache}")
-        print(f"  assigned_drone : {drone_id}")
-        print(f"  drone.status   : {drone.get('status')}")
-        print(f"  drone.serving_order_id: {drone.get('serving_order_id')}")
-        print(f"  drone.planned_stops len: {len(drone.get('planned_stops', []))}")
-        print(f"  in drone_candidate_mappings of drones: {in_candidate_drones}")
-        print(f"  in _filtered_candidates_sets of drones: {in_filtered_drones}")
-        print(f"  issues:")
-        for iss in issues:
-            print(f"    - {iss}")
-        print(f"{'='*70}\n")
 
     def _order_in_planned_stops(self, order_id, planned_stops):
         """Check if an order appears in the planned stops (D stop)"""
@@ -1533,7 +1367,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'current_load': 0,
                 'battery_level': 100.0,
                 'max_battery': 100.0,
-                'battery_consumption_rate': 0.2,
+                'battery_consumption_rate': 0.5,
                 'charging_rate': 10.0,
                 'cancellation_rate': 0.005,
                 'total_distance_today': 0.0,
@@ -2020,12 +1854,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 清理过期分配
         self._cleanup_stale_assignments()
 
-        # 强制状态同步
-        self._force_state_synchronization()
-
-        # 严格一致性检查（同步修复之后执行，避免误报瞬态异常）
-        self._run_post_sync_consistency_check()
-
         # 更新系统状态（扩展点）
         self._update_system_state()
 
@@ -2226,158 +2054,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.active_orders.discard(order_id)
         self.completed_orders.add(order_id)
 
-    def _force_state_synchronization(self):
-        """强制状态同步：确保订单与无人机状态一致，包括货物不变性"""
-        drone_real_orders = {d_id: set() for d_id in self.drones}
 
-        for drone_id, drone in self.drones.items():
-            # cargo-based "real orders" (picked up but not delivered)
-            for oid in drone.get('cargo', set()):
-                if oid in self.orders:
-                    order = self.orders[oid]
-                    if order['status'] == OrderStatus.PICKED_UP:
-                        drone_real_orders[drone_id].add(oid)
-
-        # ========== Cargo Invariant Validation & Repair (Task B) ==========
-        # Invariant 1: If order status is PICKED_UP and assigned_drone==d, order must be in drone['cargo']
-        # Invariant 2: If order is in drone['cargo'], order status must be PICKED_UP and assigned_drone==d
-
-        # Check all orders for invariant 1
-        for order_id, order in list(self.orders.items()):
-            if order['status'] == OrderStatus.PICKED_UP:
-                drone_id = order.get('assigned_drone', -1)
-                if drone_id >= 0 and drone_id in self.drones:
-                    drone = self.drones[drone_id]
-                    # Skip cargo repair for inactive drones: an IDLE/CHARGING drone
-                    # should not hold cargo.  The main loop below will resolve the
-                    # inconsistent PICKED_UP order instead of re-adding it to cargo
-                    # (which would then prevent the main loop from fixing it).
-                    if drone['status'] in (DroneStatus.IDLE, DroneStatus.CHARGING):
-                        continue
-                    if order_id not in drone.get('cargo', set()):
-                        # Repair: add to cargo
-                        if 'cargo' not in drone:
-                            drone['cargo'] = set()
-                        drone['cargo'].add(order_id)
-                        if self.debug_state_warnings:
-                            print(f"[Repair] 订单 {order_id} (PICKED_UP) 添加到无人机 {drone_id} 的货物中")
-
-        # Check all drones for invariant 2
-        for drone_id, drone in self.drones.items():
-            cargo = drone.get('cargo', set())
-            invalid_cargo = []
-            for order_id in list(cargo):
-                if order_id not in self.orders:
-                    # Order doesn't exist - remove from cargo
-                    invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 不存在，从无人机 {drone_id} 货物中移除")
-                    continue
-
-                order = self.orders[order_id]
-                if order['status'] not in [OrderStatus.PICKED_UP]:
-                    # Order status is not PICKED_UP - remove from cargo
-                    invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 状态为 {order['status']}，从无人机 {drone_id} 货物中移除")
-                    continue
-
-                if order.get('assigned_drone', -1) != drone_id:
-                    # Order not assigned to this drone - remove from cargo
-                    invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 未分配给无人机 {drone_id}，从货物中移除")
-                    continue
-
-            # Remove invalid cargo items
-            for order_id in invalid_cargo:
-                cargo.discard(order_id)
-
-        # Invariant 3: Restore serving_order_id for FLYING_TO_CUSTOMER drones that lost
-        # their serving link (e.g. after a blocked IDLE transition cleared it prematurely).
-        # Only applies to FLYING_TO_CUSTOMER; other active statuses handle their own serving
-        # order via the task-selection or arrival logic.
-        for drone_id, drone in self.drones.items():
-            if drone['status'] != DroneStatus.FLYING_TO_CUSTOMER:
-                continue
-            if drone.get('serving_order_id') is not None:
-                # Validate the existing serving_order_id is still coherent
-                soid = drone['serving_order_id']
-                if (soid in self.orders and
-                        self.orders[soid]['status'] == OrderStatus.PICKED_UP and
-                        self.orders[soid].get('assigned_drone') == drone_id):
-                    continue  # Still valid; nothing to repair
-            # serving_order_id missing or stale — scan cargo for a PICKED_UP order
-            cargo = drone.get('cargo', set())
-            for oid in cargo:
-                if oid not in self.orders:
-                    continue
-                order = self.orders[oid]
-                if (order['status'] == OrderStatus.PICKED_UP and
-                        order.get('assigned_drone') == drone_id):
-                    customer_loc = order.get('customer_location')
-                    if customer_loc:
-                        drone['serving_order_id'] = oid
-                        # Re-aim at customer if target is stale
-                        if drone.get('target_location') != customer_loc:
-                            drone['target_location'] = customer_loc
-                        if self.debug_state_warnings:
-                            print(f"[Repair] 无人机 {drone_id} serving_order_id 恢复为 {oid}")
-                    break
-
-        for order_id in list(self.active_orders):
-            if order_id not in self.orders:
-                self.active_orders.discard(order_id)
-                continue
-
-            order = self.orders[order_id]
-            if order['status'] not in [OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]:
-                continue
-
-            drone_id = order.get('assigned_drone', -1)
-
-            if drone_id is None or drone_id < 0 or drone_id not in self.drones:
-                self._reset_order_to_ready(order_id, "invalid_drone_id")
-                continue
-
-            drone = self.drones[drone_id]
-
-            if drone['status'] in [DroneStatus.IDLE, DroneStatus.CHARGING]:
-                # An inactive drone must not own any ASSIGNED or PICKED_UP orders.
-                # Remove the drone_real_orders guard here: even if the order slipped
-                # into cargo (e.g. via the Invariant-1 repair before this loop ran),
-                # we still want to resolve it unconditionally.
-                if order['status'] == OrderStatus.PICKED_UP:
-                    self._force_complete_order(order_id, drone_id)
-                else:
-                    self._reset_order_to_ready(order_id, "drone_idle")
-                continue
-
-            if drone['status'] == DroneStatus.RETURNING_TO_BASE:
-                if order['status'] == OrderStatus.ASSIGNED:
-                    self._reset_order_to_ready(order_id, "drone_returning")
-                elif order['status'] == OrderStatus.PICKED_UP:
-                    self._force_complete_order(order_id, drone_id)
-                continue
-
-            if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-                # In task-selection / route-plan mode, orders are picked up explicitly
-                # via _execute_pickup_stop or the FLYING_TO_MERCHANT arrival handler.
-                # FLYING_TO_CUSTOMER + ASSIGNED here means an inconsistency; skip.
-                pass
-
-        # Single-pass load recalculation: O(N+D) instead of O(D*N)
-        load_counts = {d_id: 0 for d_id in self.drones}
-        for order_id in self.active_orders:
-            order = self.orders.get(order_id)
-            if order is None:
-                continue
-            if order['status'] in (OrderStatus.ASSIGNED, OrderStatus.PICKED_UP):
-                d = order.get('assigned_drone')
-                if d is not None and d >= 0 and d in load_counts:
-                    load_counts[d] += 1
-        for drone_id, drone in self.drones.items():
-            drone['current_load'] = load_counts[drone_id]
 
     # ------------------ overtime termination ------------------
 
@@ -3265,57 +2942,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if self.enable_random_events:
             self._handle_random_events()
 
-    def _run_post_sync_consistency_check(self):
-        """Run strict state consistency check after _force_state_synchronization().
-
-        This is called from step() after repair so that transient states created
-        during event processing (e.g. PICKED_UP + IDLE) have already been resolved
-        before any issue is reported.
-        """
-        consistency_issues = self.state_manager.get_state_consistency_check()
-
-        if self.debug_state_warnings:
-            # Detailed mode: print all issues with categorization
-            if consistency_issues:
-                # Categorize issues using helper method
-                category_lists = {
-                    'Route': [],
-                    'TaskSel': [],
-                    'Legacy': [],
-                    'Other': []
-                }
-
-                for issue in consistency_issues:
-                    if '[Route]' in issue:
-                        category_lists['Route'].append(issue)
-                    elif '[TaskSel]' in issue:
-                        category_lists['TaskSel'].append(issue)
-                    elif '[Invariant]' in issue:
-                        category_lists['Invariant'].append(issue)
-                    else:
-                        category_lists['Other'].append(issue)
-
-                print(f"\n=== 状态一致性警告 (Step {self.time_system.current_step}) ===")
-                for category, issues in category_lists.items():
-                    if issues:
-                        print(f"\n{category} 问题 ({len(issues)}):")
-                        for issue in issues:
-                            print(f"  - {issue}")
-                print("=" * 60)
-        else:
-            # Periodic summary mode: print categorized count every 64 steps
-            if self.time_system.current_step % 64 == 0:
-                if consistency_issues:
-                    # Categorize and count using helper method
-                    counts = self.state_manager.categorize_issues(consistency_issues)
-
-                    # Print summary
-                    category_str = ", ".join([f"{k}={v}" for k, v in counts.items() if v > 0])
-                    print(
-                        f"[Step {self.time_system.current_step}] 状态一致性问题计数: {len(consistency_issues)} ({category_str})")
-                else:
-                    # No issues - print success message
-                    print(f"[Step {self.time_system.current_step}] 状态一致性检查: ✓ 无问题")
 
     def _update_merchant_preparation(self):
         for merchant_id, merchant in self.merchants.items():
@@ -3693,7 +3319,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             else:
                                 # Pickup succeeded but customer location is missing – undo pickup
                                 # so the order can be re-routed rather than leaving the drone IDLE
-                                # with a PICKED_UP order in cargo (the PICKED_UP + IDLE anomaly).
                                 drone['cargo'].discard(serving_order_id)
                                 self._reset_order_to_ready(serving_order_id,
                                                            "task_selection_no_customer_location")
