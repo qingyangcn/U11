@@ -290,8 +290,8 @@ class StateManager:
                 categories['Route'] += 1
             elif '[TaskSel]' in issue:
                 categories['TaskSel'] += 1
-            elif '[Legacy]' in issue:
-                categories['Legacy'] += 1
+            elif '[Invariant]' in issue:
+                categories['Invariant'] += 1
             else:
                 categories['Other'] += 1
 
@@ -379,16 +379,16 @@ class StateManager:
                         # Only flag if drone is in a clearly wrong state (IDLE/CHARGING with assigned orders is OK)
                         if drone['status'] in [DroneStatus.RETURNING_TO_BASE]:
                             issues.append(
-                                f"[Legacy] 订单 {order_id} 已分配但无人机 {drone_id} 正在返航: {drone['status']}")
+                                f"[Invariant] 订单 {order_id} 已分配但无人机 {drone_id} 正在返航: {drone['status']}")
 
                     elif order['status'] == OrderStatus.PICKED_UP:
                         # PICKED_UP orders should be in cargo (check cargo invariant)
                         if order_id not in drone.get('cargo', set()):
-                            issues.append(f"[Legacy] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物中")
+                            issues.append(f"[Invariant] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物中")
                         if drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER,
                                                    DroneStatus.FLYING_TO_MERCHANT]:
                             issues.append(
-                                f"[Legacy] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
+                                f"[Invariant] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
 
             # Track the first order that triggered any new issues
             if first_anomaly_order_id is None and len(issues) > issues_before:
@@ -3292,8 +3292,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         category_lists['Route'].append(issue)
                     elif '[TaskSel]' in issue:
                         category_lists['TaskSel'].append(issue)
-                    elif '[Legacy]' in issue:
-                        category_lists['Legacy'].append(issue)
+                    elif '[Invariant]' in issue:
+                        category_lists['Invariant'].append(issue)
                     else:
                         category_lists['Other'].append(issue)
 

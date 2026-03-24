@@ -171,12 +171,12 @@ def print_env_diagnostic(env: ThreeObjectiveDroneDeliveryEnv,
 
 def print_greedy_analysis(rule_counter: Counter, reward_history: list,
                           decision_count: int) -> None:
-    """Analyse whether decision patterns suggest greedy or return-optimising behaviour.
+    """Analyse whether decision patterns suggest greedy or return-optimising behavior.
 
     Prints:
     * Rule selection distribution.
     * Per-step reward statistics.
-    * Qualitative verdict on greedy vs return-optimising behaviour.
+    * Qualitative verdict on greedy vs return-optimizing behavior.
 
     Args:
         rule_counter: Counter mapping rule_id → number of times selected.
@@ -235,10 +235,10 @@ def print_greedy_analysis(rule_counter: Counter, reward_history: list,
     if dominant_pct > 90:
         if dominant_rule == 3:
             print("  ⚠  Rule 3 (nearest pickup) was used >90% of the time.")
-            print("     This is *greedy* behaviour: the agent always picks the")
+            print("     This is *greedy* behavior: the agent always picks the")
             print("     closest order rather than planning long-term routes.")
             print("     If this is the trained PPO policy, the policy has collapsed")
-            print("     to a greedy heuristic and is NOT maximising cumulative return.")
+            print("     to a greedy heuristic and is NOT maximizing cumulative return.")
         else:
             print(f"  ⚠  A single rule ({dominant_rule}) dominates ({dominant_pct:.1f}%).")
             print("     The policy may have collapsed to a greedy heuristic.")
@@ -246,8 +246,8 @@ def print_greedy_analysis(rule_counter: Counter, reward_history: list,
         print("  ℹ  No decisions recorded — check executor configuration.")
     else:
         print("  ✓  Multiple rules used. Policy appears to vary its decisions,")
-        print("     which is consistent with return-optimising (non-greedy) behaviour.")
-        print("     NOTE: PPO with gamma=0.99 and GAE(lambda=0.95) maximises")
+        print("     which is consistent with return-optimizing (non-greedy) behavior.")
+        print("     NOTE: PPO with gamma=0.99 and GAE(lambda=0.95) maximizes")
         print("     G_t = Σ γᵏ·r_{t+k}  (discounted cumulative return),")
         print("     NOT the greedy immediate reward.  Training is meaningful.")
     print("=" * 70)
