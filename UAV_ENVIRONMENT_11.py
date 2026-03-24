@@ -385,12 +385,10 @@ class StateManager:
                         # PICKED_UP orders should be in cargo (check cargo invariant)
                         if order_id not in drone.get('cargo', set()):
                             issues.append(f"[Legacy] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物中")
-                        # Allow FLYING_TO_MERCHANT for batch orders (picking up another order)
-                        if drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING,
+                        if drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER,
                                                    DroneStatus.FLYING_TO_MERCHANT]:
-                            if not ('batch_orders' in drone and order_id in drone['batch_orders']):
-                                issues.append(
-                                    f"[Legacy] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
+                            issues.append(
+                                f"[Legacy] 订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
 
             # Track the first order that triggered any new issues
             if first_anomaly_order_id is None and len(issues) > issues_before:
@@ -1162,8 +1160,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  # ===== U9: Candidate-based filtering parameters =====
                  candidate_fallback_enabled: bool = True,  # Allow fallback to full active_orders if candidates empty
                  candidate_update_interval: int = 1,  # Update candidates every N steps (1=every step, 0=only on reset)
-                 # ===== Legacy fallback control =====
-                 enable_legacy_fallback: bool = True,  # Enable legacy fallback behavior for backward compatibility
                  # ===== Diagnostics control =====
                  enable_diagnostics: bool = False,  # Enable detailed diagnostics for debugging
                  diagnostics_interval: int = 64,  # Print diagnostics every N steps
@@ -1239,11 +1235,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
         self.timeout_factor = float(timeout_factor)  # Deadline multiplier，已经用超时取消模型替代固定
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
-
-        # ========== Legacy fallback control ==========
-        self.enable_legacy_fallback = bool(enable_legacy_fallback)
-        self.legacy_blocked_count = 0  # Counter for blocked legacy attempts
-        self.legacy_blocked_reasons = defaultdict(int)  # Track reasons for blocking
 
         # ========== Diagnostics control ==========
         self.enable_diagnostics = bool(enable_diagnostics)
@@ -1945,9 +1936,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # U9: Initialize filtered candidates from external generator
         self.update_filtered_candidates()
 
-        # Reset legacy fallback counter and reasons
-        self.legacy_blocked_count = 0
-        self.legacy_blocked_reasons.clear()
+        # Reset action counters
         self.action_applied_count = 0
 
         # Initialize decision point cache for diagnostics
@@ -2145,8 +2134,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.drones[i]['serving_order_id'] = None  # U7 task-selection state
             keys_to_remove = ['task_start_location', 'task_start_step', 'accumulated_distance',
                               'optimal_distance', 'last_location', 'target_location',
-                              'batch_orders', 'current_batch_index', 'current_delivery_index',
-                              'waiting_start_time', 'route_preferences',
+                              'route_preferences',
                               'current_task_distance', 'task_optimal_distance', 'trip_started',
                               'trip_actual_distance', 'trip_optimal_distance']
             for key in keys_to_remove:
@@ -2193,9 +2181,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         if old_drone is not None and old_drone >= 0 and old_drone in self.drones:
             self.drones[old_drone]['current_load'] = max(0, self.drones[old_drone]['current_load'] - 1)
-            if 'batch_orders' in self.drones[old_drone]:
-                if order_id in self.drones[old_drone]['batch_orders']:
-                    self.drones[old_drone]['batch_orders'].remove(order_id)
 
     def _force_complete_order(self, order_id, drone_id):
         """强制完成订单（用于异常状态恢复）（走 StateManager）"""
@@ -2235,13 +2220,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         drone_real_orders = {d_id: set() for d_id in self.drones}
 
         for drone_id, drone in self.drones.items():
-            if 'batch_orders' in drone and drone['batch_orders']:
-                for order_id in drone['batch_orders']:
-                    if order_id in self.orders:
-                        order = self.orders[order_id]
-                        if order['status'] in [OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]:
-                            drone_real_orders[drone_id].add(order_id)
-            # --- ADD: cargo-based "real orders" (picked up but not delivered) ---
+            # cargo-based "real orders" (picked up but not delivered)
             for oid in drone.get('cargo', set()):
                 if oid in self.orders:
                     order = self.orders[oid]
@@ -2371,43 +2350,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
 
             if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-                # Route-aware fix: Only auto-pickup if NOT in route-plan mode
-                # In route-plan mode, orders are picked up explicitly at P stops
-                # Note: route_committed is set to True in apply_route_plan and cleared to False
-                # in _safe_reset_drone and when drone returns to base (RETURNING_TO_BASE arrival handler)
-                if not drone.get('route_committed', False):
-                    # Legacy mode: auto-pickup when flying to customer
-                    # Don't auto-pickup in task-selection mode (serving_order_id present)
-                    # Only execute if legacy fallback is enabled
-                    if drone.get('serving_order_id') is None:
-                        if self.enable_legacy_fallback:
-                            if order['status'] == OrderStatus.ASSIGNED:
-                                self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
-                                                                       reason="sync_assigned_to_picked_up")
-                                if 'pickup_time' not in order:
-                                    order['pickup_time'] = self.time_system.current_step
-                        else:
-                            # Legacy auto-pickup blocked
-                            if order['status'] == OrderStatus.ASSIGNED:
-                                self.legacy_blocked_count += 1
-                                if self.debug_state_warnings:
-                                    print(f"[Legacy Blocked] Auto-pickup for order {order_id} on drone {drone_id} - "
-                                          f"total_blocked={self.legacy_blocked_count}")
-
-        for drone_id, drone in self.drones.items():
-            if 'batch_orders' in drone:
-                valid_batch = []
-                for order_id in drone['batch_orders']:
-                    if order_id in self.orders:
-                        order = self.orders[order_id]
-                        if (order['status'] in [OrderStatus.ASSIGNED, OrderStatus.PICKED_UP] and
-                                order.get('assigned_drone') == drone_id):
-                            valid_batch.append(order_id)
-
-                if valid_batch:
-                    drone['batch_orders'] = valid_batch
-                else:
-                    self._clear_drone_batch_state(drone)
+                # In task-selection / route-plan mode, orders are picked up explicitly
+                # via _execute_pickup_stop or the FLYING_TO_MERCHANT arrival handler.
+                # FLYING_TO_CUSTOMER + ASSIGNED here means an inconsistency; skip.
+                pass
 
         # Single-pass load recalculation: O(N+D) instead of O(D*N)
         load_counts = {d_id: 0 for d_id in self.drones}
@@ -2421,12 +2367,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     load_counts[d] += 1
         for drone_id, drone in self.drones.items():
             drone['current_load'] = load_counts[drone_id]
-
-    def _clear_drone_batch_state(self, drone):
-        keys_to_remove = ['batch_orders', 'current_batch_index', 'current_delivery_index', 'waiting_start_time']
-        for key in keys_to_remove:
-            if key in drone:
-                del drone[key]
 
     # ------------------ overtime termination ------------------
 
@@ -3540,12 +3480,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     if drone["status"] != DroneStatus.RETURNING_TO_BASE:
                         self._force_return_due_to_low_battery(drone_id, drone)
 
-            elif drone["status"] == DroneStatus.WAITING_FOR_PICKUP:
-                self._handle_waiting_pickup(drone_id, drone)
-
-            elif drone["status"] == DroneStatus.DELIVERING:
-                self._handle_delivering(drone_id, drone)
-
             elif drone["status"] == DroneStatus.CHARGING:
                 self._handle_charging(drone_id, drone)
 
@@ -3931,8 +3865,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone = self.drones[drone_id]
             drone['orders_completed'] += 1
             drone['current_load'] = max(0, drone['current_load'] - 1)
-            if 'batch_orders' in drone and order_id in drone['batch_orders']:
-                drone['batch_orders'].remove(order_id)
 
         delivery_duration = order['delivery_time'] - order['creation_time']
         self.metrics['total_delivery_time'] += delivery_duration
@@ -4003,17 +3935,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 elif order['status'] == OrderStatus.PICKED_UP:
                     self._complete_order_delivery(order_id, drone_id)
 
-        if 'batch_orders' in drone:
-            for batch_order_id in drone['batch_orders']:
-                if batch_order_id in self.orders:
-                    batch_order = self.orders[batch_order_id]
-                    if batch_order['status'] == OrderStatus.ASSIGNED:
-                        self._reset_order_to_ready(batch_order_id, "reset_drone_to_base_batch")
-            del drone['batch_orders']
-
-        drone.pop('current_batch_index', None)
-        drone.pop('current_delivery_index', None)
-
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
@@ -4068,51 +3989,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         drone['serving_order_id'] = None
         drone['current_load'] = 0
 
-        # Clear batch state if exists
-        if 'batch_orders' in drone:
-            del drone['batch_orders']
-        drone.pop('current_batch_index', None)
-        drone.pop('current_delivery_index', None)
-
         # Set drone to return to base
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
-
-    def _handle_waiting_pickup(self, drone_id, drone):
-        assigned_order = self._get_drone_assigned_order(drone_id)
-
-        if assigned_order:
-            if assigned_order['status'] == OrderStatus.READY:
-                self.state_manager.update_order_status(
-                    assigned_order['id'], OrderStatus.ASSIGNED, reason="waiting_to_assigned"
-                )
-                assigned_order['assigned_drone'] = drone_id
-
-            if assigned_order['status'] == OrderStatus.ASSIGNED:
-                self.state_manager.update_order_status(
-                    assigned_order['id'], OrderStatus.PICKED_UP, reason="pickup_complete"
-                )
-                assigned_order['pickup_time'] = self.time_system.current_step
-
-                self.state_manager.update_drone_status(
-                    drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=assigned_order['customer_location']
-                )
-                return
-
-        if 'waiting_start_time' not in drone:
-            drone['waiting_start_time'] = self.time_system.current_step
-
-        waiting_duration = self.time_system.current_step - drone['waiting_start_time']
-        if waiting_duration > 10:
-            if assigned_order:
-                self._cancel_order(assigned_order['id'], "waiting_timeout")
-            self._reset_drone_to_base(drone_id, drone)
-
-    def _handle_delivering(self, drone_id, drone):
-        assigned_order = self._get_drone_assigned_order(drone_id)
-        if assigned_order and assigned_order['status'] == OrderStatus.PICKED_UP:
-            self._complete_order_delivery(assigned_order['id'], drone_id)
-        self._reset_drone_to_base(drone_id, drone)
 
     def _handle_charging(self, drone_id, drone):
         if drone['battery_level'] < 95:
@@ -4481,12 +4360,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             avg_wait = self.daily_stats['total_waiting_time'] / self.daily_stats['orders_completed']
             print(f"  平均等待时间: {avg_wait:.2f} steps")
         #print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
-
-        # Report legacy blocked count if any
-        if self.legacy_blocked_count > 0:
-            print(f"  Legacy fallback blocked: {self.legacy_blocked_count} times")
-        elif not self.enable_legacy_fallback:
-            print(f"  Legacy fallback: DISABLED (0 attempts blocked)")
 
         unfinished_orders = list(self.active_orders)
         for order_id in unfinished_orders:
@@ -4948,15 +4821,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 rule_name = rule_names[rule_id] if rule_id < len(rule_names) else f"Rule{rule_id}"
                 print(f"    Rule {rule_id} ({rule_name}): {count} ({pct:.1f}%)")
 
-        # Legacy blocking info
-        if not self.enable_legacy_fallback:
-            print(f"  Legacy fallback: DISABLED")
-            print(f"  Legacy blocked count: {self.legacy_blocked_count}")
-            if self.legacy_blocked_reasons:
-                print(f"  Legacy blocked reasons: {dict(self.legacy_blocked_reasons)}")
-        else:
-            print(f"  Legacy fallback: ENABLED")
-
         # Order stats - use incremental cache (always maintained, even when empty)
         ready_count = len(self._ready_orders_cache)
         assigned_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.ASSIGNED)
@@ -5010,8 +4874,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             },
             'time_state': self.time_system.get_time_state(),
             'backlog_size': len(self.active_orders),
-            'legacy_blocked_count': self.legacy_blocked_count,
-            'legacy_fallback_enabled': self.enable_legacy_fallback,
             # Add diagnostics statistics (consistent with strict counting)
             'drones_at_decision_points': self._last_decision_points_count,
             'actions_applied_this_step': self.action_applied_count,
