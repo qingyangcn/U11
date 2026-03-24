@@ -3264,51 +3264,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         return True
 
-    def _process_batch_assignment(self, drone_id, order_ids):
-        """环境内部执行批量订单分配：给 MPSO 调用"""
-        if not order_ids:
-            return
-        drone = self.drones[drone_id]
 
-        can_take = max(0, drone['max_capacity'] - drone['current_load'])
-        if can_take <= 0:
-            return
-
-        cand = []
-        for oid in order_ids:
-            o = self.orders.get(oid)
-            if o is None or o['status'] != OrderStatus.READY:
-                continue
-            if o.get('assigned_drone', -1) not in (-1, None):
-                continue
-            cand.append(oid)
-            if len(cand) >= can_take:
-                break
-        if not cand:
-            return
-
-        actually_assigned = []
-        for oid in cand:
-            before = drone['current_load']
-            self._process_single_assignment(drone_id, oid, allow_busy=True)
-            if drone['current_load'] > before:
-                actually_assigned.append(oid)
-
-        if not actually_assigned:
-            return
-
-        # KEY FIX: Set serving_order_id to first order in batch
-        drone['serving_order_id'] = actually_assigned[0]
-
-        first_order = self.orders[actually_assigned[0]]
-        self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT,
-                                               first_order['merchant_location'])
-
-        if 'batch_orders' not in drone:
-            drone['batch_orders'] = []
-        drone['batch_orders'].extend(actually_assigned)
-        if 'current_batch_index' not in drone:
-            drone['current_batch_index'] = 0
 
     def _process_single_assignment(self, drone_id, order_id, allow_busy=False):
         """处理单个订单分配（记录任务起点 + 走 StateManager）"""
@@ -3749,71 +3705,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     return True
         return False
 
-    def _handle_batch_pickup(self, drone_id, drone):
-        if 'batch_orders' not in drone or not drone['batch_orders']:
-            self._safe_reset_drone(drone_id, drone)
-            return
-
-        picked_count = 0
-        for order_id in drone['batch_orders']:
-            order = self.orders.get(order_id)
-            if order and order['status'] == OrderStatus.ASSIGNED:
-                self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP, reason="batch_pickup")
-                order['pickup_time'] = self.time_system.current_step
-                picked_count += 1
-
-        if picked_count == 0:
-            self._safe_reset_drone(drone_id, drone)
-            return
-
-        self._start_batch_delivery(drone_id, drone)
-
-    def _start_batch_delivery(self, drone_id, drone):
-        if 'batch_orders' not in drone or not drone['batch_orders']:
-            self._safe_reset_drone(drone_id, drone)
-            return
-
-        drone['current_delivery_index'] = 0
-
-        for i, order_id in enumerate(drone['batch_orders']):
-            order = self.orders.get(order_id)
-            if order and order['status'] == OrderStatus.PICKED_UP:
-                drone['current_delivery_index'] = i
-
-                self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_CUSTOMER,
-                                                       target_location=order['customer_location'])
-                return
-
-        self._safe_reset_drone(drone_id, drone)
-
-    def _handle_batch_delivery(self, drone_id, drone):
-        if 'batch_orders' not in drone or not drone['batch_orders']:
-            self._safe_reset_drone(drone_id, drone)
-            return
-
-        current_index = drone.get('current_delivery_index', 0)
-
-        if current_index < len(drone['batch_orders']):
-            order_id = drone['batch_orders'][current_index]
-            order = self.orders.get(order_id)
-            if order and order['status'] == OrderStatus.PICKED_UP:
-                self._complete_order_delivery(order_id, drone_id)
-
-        current_index += 1
-
-        while current_index < len(drone['batch_orders']):
-            order_id = drone['batch_orders'][current_index]
-            order = self.orders.get(order_id)
-
-            if order and order['status'] == OrderStatus.PICKED_UP:
-                drone['current_delivery_index'] = current_index
-                self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_CUSTOMER,
-                                                       target_location=order['customer_location'])
-                return
-
-            current_index += 1
-
-        self._safe_reset_drone(drone_id, drone)
 
     def _handle_drone_arrival(self, drone_id, drone):
         """
