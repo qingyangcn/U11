@@ -243,7 +243,7 @@ def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
         cloc = o.get('customer_location')
         if cloc is None:
             continue
-        key = (round(cloc[0], 2), round(cloc[1], 2))
+        key = (cloc[0], cloc[1])  # use raw float tuple; customer_location is set once at order creation
         if key not in cust_map:
             cust_map[key] = (cust_idx_counter, cloc, [])
             cust_idx_counter += 1
@@ -410,7 +410,7 @@ def _run_diag_episode(executor: DecentralizedEventDrivenExecutor,
                 chosen = executor.policy_fn(local_obs)
                 rule_counter[chosen] += 1
 
-        obs, reward, terminated, truncated, info = executor.step()
+        _, reward, terminated, truncated, info = executor.step()
         reward_history.append(float(reward))
 
         if diag_interval > 0 and (step_num + 1) % diag_interval == 0:
