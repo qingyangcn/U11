@@ -2467,12 +2467,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         Select an order for a drone based on the specified rule ID.
 
+        All rules select from the drone's task queue (ASSIGNED + PICKED_UP orders
+        assigned to this drone) plus any additional MOPSO candidate orders.
+        MOPSO batch-assigns READY candidates → ASSIGNED before rules are invoked.
+
         Rules (R=5):
-        0: CARGO_FIRST - Prioritize delivering picked-up orders
-        1: ASSIGNED_EDF - Earliest deadline first from assigned orders
-        2: READY_EDF - Earliest deadline first from ready orders
-        3: NEAREST_PICKUP - Closest pickup location
-        4: SLACK_PER_DISTANCE - Maximize slack/distance ratio
+        0: CARGO_FIRST    - PICKED_UP cargo first, then task queue by EDF
+        1: TASK_EDF       - Earliest deadline first from task queue (ASSIGNED + PICKED_UP)
+        2: TASK_LDF       - Latest deadline first from task queue (complementary to EDF)
+        3: NEAREST_STOP   - Closest next waypoint (merchant or customer)
+        4: SLACK_DISTANCE - Maximize slack/distance ratio
 
         Returns:
             order_id if a valid order is selected, None otherwise
@@ -2519,24 +2523,33 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return best_order_id
 
     def _rule_assigned_edf(self, drone_id: int) -> Optional[int]:
-        """Rule 1: ASSIGNED_EDF - Earliest deadline first from assigned orders."""
+        """Rule 1: TASK_EDF - Earliest deadline first from the drone's task queue.
+
+        Task queue = ASSIGNED orders assigned to this drone (pending pickup) +
+                     PICKED_UP orders in drone cargo (pending delivery).
+        This gives the drone access to its full task queue via EDF.
+        """
         best_order_id = None
         best_deadline = float('inf')
 
-        # U9: Apply candidate filtering
-        candidate_constrained_orders = self._get_candidate_constrained_orders(
+        candidate_orders = self._get_candidate_constrained_orders(
             drone_id, list(self.active_orders)
         )
 
-        for order_id in candidate_constrained_orders:
+        for order_id in candidate_orders:
             if order_id not in self.orders:
                 continue
             order = self.orders[order_id]
 
-            # Only consider ASSIGNED orders for this drone
-            if order['status'] != OrderStatus.ASSIGNED:
-                continue
-            if order.get('assigned_drone') != drone_id:
+            # ASSIGNED orders that belong to this drone (pending pickup)
+            if order['status'] == OrderStatus.ASSIGNED:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+            # PICKED_UP orders in drone cargo (pending delivery)
+            elif order['status'] == OrderStatus.PICKED_UP:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+            else:
                 continue
 
             deadline = self._get_delivery_deadline_step(order)
@@ -2547,66 +2560,91 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return best_order_id
 
     def _rule_ready_edf(self, drone_id: int) -> Optional[int]:
-        """Rule 2: EDF (Earliest Deadline First) across all candidate orders.
+        """Rule 2: TASK_LDF - Latest-Deadline-First across the drone's task queue.
 
-        With MOPSO batch assignment, READY orders in the candidate set are
-        immediately committed as ASSIGNED.  This rule therefore considers
-        ASSIGNED orders for this drone first (EDF), then PICKED_UP orders as
-        a tiebreaker.  It remains a distinct rule from ASSIGNED_EDF (Rule 1)
-        because it gives RL a second EDF signal that can be useful when the
-        policy needs to differentiate between rules.
+        Selects the order with the *most* remaining slack from the drone's task
+        queue (ASSIGNED + PICKED_UP).  This is a complementary signal to Rule 1
+        (EDF), letting the RL policy learn when to prioritise a less-urgent task
+        (e.g., to batch pickups efficiently) versus urgency-driven dispatch.
         """
-        # Delegate to ASSIGNED_EDF – since MOPSO pre-assigns all candidates,
-        # READY unassigned orders should no longer appear in the candidate set
-        # for this drone.  If they do (e.g. no generator set, fallback active),
-        # ASSIGNED_EDF still makes a sensible choice.
-        return self._rule_assigned_edf(drone_id)
+        best_order_id = None
+        best_deadline = -float('inf')
+
+        candidate_orders = self._get_candidate_constrained_orders(
+            drone_id, list(self.active_orders)
+        )
+
+        for order_id in candidate_orders:
+            if order_id not in self.orders:
+                continue
+            order = self.orders[order_id]
+
+            if order['status'] == OrderStatus.ASSIGNED:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+            elif order['status'] == OrderStatus.PICKED_UP:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+            else:
+                continue
+
+            deadline = self._get_delivery_deadline_step(order)
+            if deadline > best_deadline:
+                best_deadline = deadline
+                best_order_id = order_id
+
+        return best_order_id
 
     def _rule_nearest_pickup(self, drone_id: int) -> Optional[int]:
-        """Rule 3: NEAREST_PICKUP - Closest pickup location from available orders."""
+        """Rule 3: NEAREST_NEXT_STOP - Closest next waypoint from the task queue.
+
+        For ASSIGNED orders: distance to merchant (pickup).
+        For PICKED_UP orders: distance to customer (delivery).
+        Selects the order whose next waypoint is closest to the drone's current
+        position, minimising flight distance.
+        """
         drone = self.drones[drone_id]
         drone_loc = drone['location']
 
         best_order_id = None
         best_distance = float('inf')
 
-        # U9: Apply candidate filtering
-        candidate_constrained_orders = self._get_candidate_constrained_orders(
+        candidate_orders = self._get_candidate_constrained_orders(
             drone_id, list(self.active_orders)
         )
 
-        # Consider both ASSIGNED orders and READY orders
-        for order_id in candidate_constrained_orders:
+        for order_id in candidate_orders:
             if order_id not in self.orders:
                 continue
             order = self.orders[order_id]
 
-            # For ASSIGNED orders: only this drone's assignments
             if order['status'] == OrderStatus.ASSIGNED:
                 if order.get('assigned_drone') != drone_id:
                     continue
-                merchant_loc = order['merchant_location']
-                distance = self._calculate_euclidean_distance(drone_loc, merchant_loc)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_order_id = order_id
+                target_loc = order['merchant_location']
+            elif order['status'] == OrderStatus.PICKED_UP:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+                target_loc = order.get('customer_location')
+                if target_loc is None:
+                    continue
+            else:
+                continue
 
-            # For READY orders: any unassigned order (if capacity allows)
-            elif order['status'] == OrderStatus.READY:
-                if order.get('assigned_drone', -1) not in (-1, None):
-                    continue
-                if drone['current_load'] >= drone['max_capacity']:
-                    continue
-                merchant_loc = order['merchant_location']
-                distance = self._calculate_euclidean_distance(drone_loc, merchant_loc)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_order_id = order_id
+            distance = self._calculate_euclidean_distance(drone_loc, target_loc)
+            if distance < best_distance:
+                best_distance = distance
+                best_order_id = order_id
 
         return best_order_id
 
     def _rule_slack_per_distance(self, drone_id: int) -> Optional[int]:
-        """Rule 4: SLACK_PER_DISTANCE - Maximize slack/distance ratio."""
+        """Rule 4: SLACK_PER_DISTANCE - Maximize slack/distance ratio.
+
+        Considers the drone's full task queue (ASSIGNED + PICKED_UP).
+        For ASSIGNED orders: distance = drone → merchant.
+        For PICKED_UP orders: distance = drone → customer.
+        """
         drone = self.drones[drone_id]
         drone_loc = drone['location']
         current_step = self.time_system.current_step
@@ -2614,36 +2652,32 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         best_order_id = None
         best_score = -float('inf')
 
-        # U9: Apply candidate filtering
-        candidate_constrained_orders = self._get_candidate_constrained_orders(
+        candidate_orders = self._get_candidate_constrained_orders(
             drone_id, list(self.active_orders)
         )
 
-        # Consider both ASSIGNED and READY orders
-        for order_id in candidate_constrained_orders:
+        for order_id in candidate_orders:
             if order_id not in self.orders:
                 continue
             order = self.orders[order_id]
 
-            # Check if order is valid candidate
-            is_valid = False
-            if order['status'] == OrderStatus.ASSIGNED and order.get('assigned_drone') == drone_id:
-                is_valid = True
-            elif order['status'] == OrderStatus.READY and order.get('assigned_drone', -1) in (-1, None):
-                if drone['current_load'] < drone['max_capacity']:
-                    is_valid = True
-
-            if not is_valid:
+            if order['status'] == OrderStatus.ASSIGNED:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+                target_loc = order['merchant_location']
+            elif order['status'] == OrderStatus.PICKED_UP:
+                if order.get('assigned_drone') != drone_id:
+                    continue
+                target_loc = order.get('customer_location')
+                if target_loc is None:
+                    continue
+            else:
                 continue
 
-            # Calculate slack and distance
             deadline = self._get_delivery_deadline_step(order)
             slack = deadline - current_step
-            merchant_loc = order['merchant_location']
-            distance = self._calculate_euclidean_distance(drone_loc, merchant_loc)
+            distance = self._calculate_euclidean_distance(drone_loc, target_loc)
 
-            # Score: slack / (distance + epsilon)
-            # Higher score = better (more slack per unit distance)
             epsilon = 0.1
             score = slack / (distance + epsilon)
 
@@ -5120,26 +5154,60 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _get_candidate_constrained_orders(self, drone_id: int, order_ids: List[int]) -> List[int]:
         """
-        Filter order_ids to only include those in the drone's candidate set.
+        Return orders the drone can route to: candidate set ∪ drone's own task queue.
+
+        "Task queue" = ASSIGNED orders assigned to this drone + PICKED_UP orders in cargo.
+        These are always included so that RL rules can select from the drone's full
+        task queue even when the MOPSO candidate set is stale or empty.
 
         Args:
             drone_id: The drone ID
-            order_ids: List of order IDs to filter
+            order_ids: List of order IDs to filter (typically list(active_orders))
 
         Returns:
-            Filtered list of order IDs that are in candidates[drone_id] ∩ order_ids
-            If candidate_fallback_enabled and no candidates, returns original order_ids
+            Filtered list of order IDs the drone may route to.
         """
-        # Use cached set for O(1) membership test (rebuilt by update_filtered_candidates)
+        # Collect the drone's own task-queue order IDs (always selectable)
+        task_queue: set = set()
+        drone = self.drones.get(drone_id)
+        if drone is not None:
+            # PICKED_UP cargo
+            for oid in drone.get('cargo', set()):
+                if oid in self.orders and self.orders[oid]['status'] == OrderStatus.PICKED_UP:
+                    task_queue.add(oid)
+            # ASSIGNED orders belonging to this drone
+            for oid in order_ids:
+                order = self.orders.get(oid)
+                if (order is not None and
+                        order['status'] == OrderStatus.ASSIGNED and
+                        order.get('assigned_drone') == drone_id):
+                    task_queue.add(oid)
+
+        # Use cached MOPSO candidate set for additional order IDs
         candidate_set = self._filtered_candidates_sets.get(drone_id)
 
-        # If no candidates and fallback is enabled, return all orders
-        if not candidate_set:
+        if not candidate_set and not task_queue:
             if self.candidate_fallback_enabled:
                 return order_ids
             return []
 
-        return [oid for oid in order_ids if oid in candidate_set and self._is_candidate_selectable(oid, drone_id)]
+        result = []
+        seen: set = set()
+        # Task-queue orders first (deterministic order: cargo then assigned by order_id)
+        for oid in sorted(task_queue):
+            if oid in seen:
+                continue
+            seen.add(oid)
+            result.append(oid)
+        # Then candidate-set orders not already in task queue
+        if candidate_set:
+            for oid in order_ids:
+                if oid in seen:
+                    continue
+                if oid in candidate_set and self._is_candidate_selectable(oid, drone_id):
+                    seen.add(oid)
+                    result.append(oid)
+        return result
 
     def _is_candidate_selectable(self, order_id: int, requesting_drone_id: int = -1) -> bool:
         """Final dirty check: ensure an order in the candidate set is still selectable.
@@ -5257,8 +5325,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Order is ASSIGNED or PICKED_UP – verify it belongs to this drone
         if order.get('assigned_drone', -1) != drone_id:
             self.last_decision_info['failure_reason'] = 'order_not_assigned_to_this_drone'
-            # Don't return False yet; let target-setting proceed if serving logic needs it
-            # but mark as failure so the caller knows
+            return False
 
         # Set serving_order_id and target
         drone['serving_order_id'] = order_id
