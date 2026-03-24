@@ -49,19 +49,45 @@ def plot_episode_paths(
         path = list(path_history[drone_id])
         if len(path) < 2:
             continue
-        xs = [p[0] for p in path]
-        ys = [p[1] for p in path]
         color = cmap(i % 20)
+
+        # Split trajectory into segments at None sentinels (break_segment markers).
+        # Each None separates one trip from the next, so lines are never drawn
+        # between the end of one trip and the start of the next.
+        segment_xs: list = []
+        segment_ys: list = []
+        first_point = True
+        for pt in path:
+            if pt is None:
+                # Flush current segment with NaN so matplotlib lifts the pen
+                if segment_xs:
+                    segment_xs.append(float("nan"))
+                    segment_ys.append(float("nan"))
+                first_point = True
+            else:
+                segment_xs.append(pt[0])
+                segment_ys.append(pt[1])
+                if first_point:
+                    # Mark the start of each trip with a star
+                    ax.plot(pt[0], pt[1], "*", color=color, markersize=7, zorder=5)
+                    first_point = False
+
+        if not segment_xs:
+            continue
+
         ax.plot(
-            xs, ys,
+            segment_xs, segment_ys,
             "-",
             color=color,
             alpha=0.55,
             linewidth=1.0,
             label=f"Drone {drone_id}",
         )
-        # Mark the end position with a filled circle
-        ax.plot(xs[-1], ys[-1], "o", color=color, markersize=4, zorder=4)
+        # Mark the final position with a filled circle
+        final_pts = [(x, y) for x, y in zip(segment_xs, segment_ys)
+                     if not (isinstance(x, float) and np.isnan(x))]
+        if final_pts:
+            ax.plot(final_pts[-1][0], final_pts[-1][1], "o", color=color, markersize=4, zorder=4)
 
     # ------------------------------------------------------------------ #
     # Base locations                                                       #

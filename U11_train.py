@@ -303,7 +303,12 @@ def train(args):
     print(f"\nAction space: {env.get_attr('action_space')[0]}")
     print(f"Observation space: {env.get_attr('observation_space')[0]}")
 
-    # Create PPO model with MlpPolicy (flat Box observation)
+    # Create PPO model with MlpPolicy (flat Box observation).
+    # PPO maximises the expected discounted cumulative return (不是单步即时奖励):
+    #   G_t = r_t + gamma*r_{t+1} + gamma^2*r_{t+2} + ...
+    # with gamma=args.gamma (default 0.99) and advantage estimated via GAE(lambda).
+    # This is *not* greedy reward maximisation — the discount factor ensures the
+    # agent considers long-term consequences across the entire delivery episode.
     model = PPO(
         policy="MlpPolicy",
         env=env,

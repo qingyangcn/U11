@@ -31,14 +31,15 @@ import csv
 import math
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
+from typing import Optional
 
 import numpy as np
 
 # Add repo root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
+from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv, DroneStatus, OrderStatus
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
 
 try:
@@ -53,6 +54,376 @@ try:
     _HAS_MOPSO = True
 except ImportError:
     _HAS_MOPSO = False
+
+
+# ---------------------------------------------------------------------------
+# Environment diagnostic helpers
+# ---------------------------------------------------------------------------
+
+_DRONE_STATUS_LABEL = {
+    DroneStatus.IDLE: 'IDLE',
+    DroneStatus.ASSIGNED: 'ASSIGNED',
+    DroneStatus.FLYING_TO_MERCHANT: 'FLY→MERCHANT',
+    DroneStatus.WAITING_FOR_PICKUP: 'WAIT_PICKUP',
+    DroneStatus.FLYING_TO_CUSTOMER: 'FLY→CUSTOMER',
+    DroneStatus.DELIVERING: 'DELIVERING',
+    DroneStatus.RETURNING_TO_BASE: 'RETURN_BASE',
+    DroneStatus.CHARGING: 'CHARGING',
+}
+
+# Keep legacy alias so any external code that imported _STATUS_ABBR still works.
+_STATUS_ABBR = _DRONE_STATUS_LABEL
+
+
+def _fmt_loc(loc) -> str:
+    """Format a (x, y) location tuple as a compact string."""
+    if loc is None:
+        return '—'
+    return f"({loc[0]:.1f},{loc[1]:.1f})"
+
+
+def _fmt_ids(ids, limit: int = 8) -> str:
+    """Format a list of IDs, truncating at *limit* with a '+N more' suffix."""
+    if not ids:
+        return '—'
+    preview = [str(i) for i in ids[:limit]]
+    suffix = f' +{len(ids)-limit}' if len(ids) > limit else ''
+    return '[' + ','.join(preview) + suffix + ']'
+
+
+def _table(title: str, headers: list, rows: list) -> None:
+    """Print a bordered ASCII table.
+
+    Args:
+        title:   Section title printed above the table.
+        headers: List of column header strings.
+        rows:    List of row lists (each element converted to str).
+    """
+    str_rows = [[str(c) for c in r] for r in rows]
+    col_widths = [len(h) for h in headers]
+    for row in str_rows:
+        for i, cell in enumerate(row):
+            if i < len(col_widths):
+                col_widths[i] = max(col_widths[i], len(cell))
+
+    sep = '+-' + '-+-'.join('-' * w for w in col_widths) + '-+'
+    hdr = '| ' + ' | '.join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + ' |'
+
+    print(f"\n  {title}")
+    print('  ' + sep)
+    print('  ' + hdr)
+    print('  ' + sep)
+    if str_rows:
+        for row in str_rows:
+            padded = [row[i].ljust(col_widths[i]) if i < len(row) else ' ' * col_widths[i]
+                      for i in range(len(headers))]
+            print('  | ' + ' | '.join(padded) + ' |')
+    else:
+        empty_row = '| ' + ' | '.join(' ' * w for w in col_widths) + ' |'
+        print('  ' + empty_row.replace('|  |', '| (no data) |', 1))
+    print('  ' + sep)
+
+
+def print_env_tables(env: ThreeObjectiveDroneDeliveryEnv,
+                     step_label: str = '',
+                     max_orders: int = 30) -> None:
+    """Print four aligned ASCII tables summarising the current environment state.
+
+    Tables printed:
+    1. **Drone** — ID, status, position, destination, accepted order IDs, load, battery
+    2. **Order** — ID, status, merchant location, customer location, drone ID,
+                   pickup timestamp, delivery timestamp
+    3. **Customer** — customer index (per unique location), location, order ID
+    4. **Merchant** — ID, location, queue depth, pending order IDs
+
+    Args:
+        env: The UAV environment (wrapped or raw).
+        step_label: Optional extra label shown in the section header.
+        max_orders: Maximum number of active orders shown in the Order table
+                    (truncated to avoid overwhelming output).
+    """
+    raw = getattr(env, 'unwrapped', env)
+    ts = raw.time_system
+    step = ts.current_step
+
+    label_part = f"  |  {step_label}" if step_label else ''
+    print('\n' + '=' * 80)
+    print(f"  ENV SNAPSHOT  step={step}  hour={ts.current_hour:.1f}{label_part}")
+    print(f"  generated={raw.daily_stats['orders_generated']}"
+          f"  completed={raw.daily_stats['orders_completed']}"
+          f"  cancelled={raw.daily_stats.get('orders_cancelled', 0)}"
+          f"  active={len(raw.active_orders)}")
+    print('=' * 80)
+
+    # ── 1. Drone table ────────────────────────────────────────────────────────
+    drone_rows = []
+    for did, drone in sorted(raw.drones.items()):
+        status_lbl = _DRONE_STATUS_LABEL.get(drone['status'],
+                                             str(drone['status'].value))
+        pos = _fmt_loc(drone.get('location'))
+        dest = _fmt_loc(drone.get('target_location'))
+        load = drone['current_load']
+        cap = drone['max_capacity']
+        battery = drone.get('battery_level', float('nan'))
+
+        # Accepted orders = cargo (picked up but not delivered) + planned deliveries
+        cargo: set = drone.get('cargo', set())
+        serving = drone.get('serving_order_id')
+        planned = [
+            s['order_id'] for s in drone.get('planned_stops', [])
+            if s.get('type') == 'D'
+        ] if drone.get('planned_stops') else []
+        accepted = sorted(
+            cargo
+            | ({serving} if serving is not None else set())
+            | set(planned)
+        )
+
+        drone_rows.append([
+            f"D{did:02d}",
+            status_lbl,
+            pos,
+            dest,
+            _fmt_ids(accepted),
+            f"{load}/{cap}",
+            f"{battery:.0f}%",
+        ])
+
+    _table(
+        "① Drone Status",
+        ["DroneID", "Status", "Position", "Destination", "Accepted Orders", "Load", "Battery"],
+        drone_rows,
+    )
+
+    # ── 2. Order table ────────────────────────────────────────────────────────
+    active_sorted = sorted(raw.active_orders)[:max_orders]
+    order_rows = []
+    for oid in active_sorted:
+        o = raw.orders.get(oid)
+        if o is None:
+            continue
+        status_name = o['status'].name if hasattr(o['status'], 'name') else str(o['status'])
+        merch_loc = _fmt_loc(o.get('merchant_location'))
+        cust_loc = _fmt_loc(o.get('customer_location'))
+        drone_id = o.get('assigned_drone', -1)
+        drone_str = f"D{drone_id:02d}" if drone_id >= 0 else '—'
+        pickup_t = o.get('pickup_time')
+        delivery_t = o.get('delivery_time')
+        order_rows.append([
+            f"#{oid}",
+            status_name,
+            merch_loc,
+            cust_loc,
+            drone_str,
+            str(pickup_t) if pickup_t is not None else '—',
+            str(delivery_t) if delivery_t is not None else '—',
+        ])
+    if len(raw.active_orders) > max_orders:
+        order_rows.append([
+            f"... +{len(raw.active_orders) - max_orders} more",
+            '', '', '', '', '', '',
+        ])
+
+    _table(
+        "② Order Status",
+        ["OrderID", "Status", "MerchantLoc", "CustomerLoc", "DroneID",
+         "PickupStep", "DeliveryStep"],
+        order_rows,
+    )
+
+    # ── 3. Customer table ─────────────────────────────────────────────────────
+    # Customers are identified by unique customer_location across active orders.
+    # We assign a stable customer index based on insertion order.
+    cust_map: dict = {}          # location_key -> (cust_idx, [order_ids])
+    cust_idx_counter = 0
+    for oid in sorted(raw.active_orders):
+        o = raw.orders.get(oid)
+        if o is None:
+            continue
+        cloc = o.get('customer_location')
+        if cloc is None:
+            continue
+        key = (cloc[0], cloc[1])  # use raw float tuple; customer_location is set once at order creation
+        if key not in cust_map:
+            cust_map[key] = (cust_idx_counter, cloc, [])
+            cust_idx_counter += 1
+        cust_map[key][2].append(oid)
+
+    customer_rows = []
+    for key, (cidx, cloc, order_ids) in sorted(cust_map.items(),
+                                                key=lambda kv: kv[1][0]):
+        customer_rows.append([
+            f"C{cidx:03d}",
+            _fmt_loc(cloc),
+            _fmt_ids(order_ids),
+        ])
+
+    _table(
+        "③ Customer Status",
+        ["CustID", "Location", "OrderIDs"],
+        customer_rows,
+    )
+
+    # ── 4. Merchant table ─────────────────────────────────────────────────────
+    merchant_rows = []
+    for mid, m in sorted(raw.merchants.items()):
+        queue_ids = list(m['queue'])
+        queue_depth = len(queue_ids)
+        # Merchant status: BUSY if queue non-empty, else IDLE
+        m_status = f"BUSY(q={queue_depth})" if queue_depth > 0 else 'IDLE'
+        merchant_rows.append([
+            str(mid),
+            _fmt_loc(m.get('location')),
+            m_status,
+            _fmt_ids(queue_ids),
+        ])
+
+    _table(
+        "④ Merchant Status",
+        ["MerchantID", "Location", "Status", "PendingOrderIDs"],
+        merchant_rows,
+    )
+
+    print()  # trailing blank line
+
+
+# Backward-compatible alias so existing call-sites that import print_env_diagnostic
+# (e.g. baseline_fixed_rules.py) continue to work without changes.
+print_env_diagnostic = print_env_tables
+
+
+def print_greedy_analysis(rule_counter: Counter, reward_history: list,
+                          decision_count: int) -> None:
+    """Analyse whether decision patterns suggest greedy or return-optimising behavior.
+
+    Prints:
+    * Rule selection distribution.
+    * Per-step reward statistics.
+    * Qualitative verdict on greedy vs return-optimizing behavior.
+
+    Args:
+        rule_counter: Counter mapping rule_id → number of times selected.
+        reward_history: List of scalar rewards received at each env step.
+        decision_count: Total number of decision calls made.
+    """
+    print("\n" + "=" * 70)
+    print("Decision-Pattern Analysis: Greedy vs. Return-Optimisation")
+    print("=" * 70)
+
+    # Rule distribution
+    total = sum(rule_counter.values())
+    if total > 0:
+        print("  Rule selection distribution:")
+        rule_names = {
+            0: "default/highest-priority",
+            1: "alt-rule-1",
+            2: "EDF (earliest deadline)",
+            3: "nearest pickup",
+            4: "slack-per-distance",
+        }
+        for rid in sorted(rule_counter):
+            cnt = rule_counter[rid]
+            pct = 100.0 * cnt / total
+            print(f"    Rule {rid} ({rule_names.get(rid, '?'):28s}): "
+                  f"{cnt:5d} ({pct:5.1f}%)")
+    else:
+        print("  No rule selections recorded.")
+
+    # Reward statistics
+    if reward_history:
+        arr = np.array(reward_history, dtype=np.float64)
+        nonzero = arr[arr != 0]
+        print(f"\n  Reward statistics (all {len(arr)} steps):")
+        print(f"    mean={arr.mean():.4f}  std={arr.std():.4f}  "
+              f"min={arr.min():.4f}  max={arr.max():.4f}")
+        print(f"    non-zero steps: {len(nonzero)} / {len(arr)}"
+              f"  ({100*len(nonzero)/max(1,len(arr)):.1f}%)")
+        if len(nonzero):
+            print(f"    non-zero mean={nonzero.mean():.4f}  "
+                  f"non-zero std={nonzero.std():.4f}")
+        # Cumulative return over time (plot a coarse view)
+        cum = np.cumsum(arr)
+        n_seg = min(10, len(cum))
+        seg_size = max(1, len(cum) // n_seg)
+        cum_samples = [float(cum[min(i * seg_size, len(cum) - 1)])
+                       for i in range(1, n_seg + 1)]
+        print(f"    cumulative return (coarse): "
+              + "  ".join(f"{v:.1f}" for v in cum_samples))
+
+    # Verdict
+    print("\n  ── Verdict ──")
+    dominant_rule = rule_counter.most_common(1)[0][0] if rule_counter else -1
+    dominant_pct = (100.0 * rule_counter[dominant_rule] / max(1, total)
+                    if rule_counter else 0.0)
+    if dominant_pct > 90:
+        if dominant_rule == 3:
+            print("  ⚠  Rule 3 (nearest pickup) was used >90% of the time.")
+            print("     This is *greedy* behavior: the agent always picks the")
+            print("     closest order rather than planning long-term routes.")
+            print("     If this is the trained PPO policy, the policy has collapsed")
+            print("     to a greedy heuristic and is NOT maximizing cumulative return.")
+        else:
+            print(f"  ⚠  A single rule ({dominant_rule}) dominates ({dominant_pct:.1f}%).")
+            print("     The policy may have collapsed to a greedy heuristic.")
+    elif total == 0:
+        print("  ℹ  No decisions recorded — check executor configuration.")
+    else:
+        print("  ✓  Multiple rules used. Policy appears to vary its decisions,")
+        print("     which is consistent with return-optimizing (non-greedy) behavior.")
+        print("     NOTE: PPO with gamma=0.99 and GAE(lambda=0.95) maximizes")
+        print("     G_t = Σ γᵏ·r_{t+k}  (discounted cumulative return),")
+        print("     NOT the greedy immediate reward.  Training is meaningful.")
+    print("=" * 70)
+
+
+def _run_diag_episode(executor: DecentralizedEventDrivenExecutor,
+                      env: ThreeObjectiveDroneDeliveryEnv,
+                      max_steps: int,
+                      diag_interval: int,
+                      seed: Optional[int] = None) -> tuple:
+    """Run an episode with periodic diagnostic prints.
+
+    Returns:
+        (rule_counter, reward_history, decision_count)
+    """
+    raw = getattr(env, 'unwrapped', env)
+    if seed is not None:
+        import random as _rnd
+        np.random.seed(seed)
+        _rnd.seed(seed)
+        obs, info = executor.reset(seed=seed)
+    else:
+        obs, info = executor.reset()
+
+    rule_counter: Counter = Counter()
+    reward_history: list = []
+    decision_count = 0
+
+    for step_num in range(max_steps):
+        decision_drones = raw.get_decision_drones()
+        if decision_drones:
+            decision_count += len(decision_drones)
+            # Track which rules were chosen
+            for did in decision_drones:
+                local_obs = executor._extract_local_observation(
+                    executor._get_current_observation(), did)
+                chosen = executor.policy_fn(local_obs)
+                rule_counter[chosen] += 1
+
+        _, reward, terminated, truncated, info = executor.step()
+        reward_history.append(float(reward))
+
+        if diag_interval > 0 and (step_num + 1) % diag_interval == 0:
+            print_env_diagnostic(env, step_label=f"decision_step={step_num+1}")
+
+        if terminated or truncated:
+            break
+
+    # Final snapshot
+    if diag_interval > 0:
+        print_env_diagnostic(env, step_label="episode-end")
+
+    return rule_counter, reward_history, decision_count
 
 
 def random_policy(local_obs: dict) -> int:
@@ -515,6 +886,8 @@ def run_sanity_check(args):
     print("U11 Decentralized Execution Sanity Check")
     print("=" * 80)
 
+    diag_interval: int = getattr(args, 'diag_interval', 0)
+
     # Create environment
     print("\nCreating environment...")
     env = _make_env(args, order_cutoff_steps=args.order_cutoff_steps)
@@ -536,7 +909,7 @@ def run_sanity_check(args):
             print(f"  Warning: MOPSO unavailable, using built-in candidates.")
 
     # Choose policy
-    if args.model_path:
+    if args.model_path and os.path.exists(args.model_path):
         print(f"\nLoading trained policy from: {args.model_path}")
         policy_fn = load_trained_policy(args.model_path, args.vecnormalize_path)
         policy_name = "Trained Policy"
@@ -554,9 +927,27 @@ def run_sanity_check(args):
         verbose=args.verbose,
     )
 
-    # Run episode
+    if diag_interval > 0:
+        # Print initial state
+        obs, info = executor.reset(seed=args.seed)
+        print_env_diagnostic(env, step_label="episode-start")
 
-    stats = executor.run_episode(max_steps=args.max_steps)
+        rule_counter, reward_history, decision_count = _run_diag_episode(
+            executor, env, args.max_steps, diag_interval, seed=None)  # already reset above
+
+        # Print summary stats
+        stats = _compute_completion_stats(env, executor)
+        print(f"\nEpisode summary: "
+              f"GC={stats['general_completion']:.4f}  "
+              f"generated={stats['generated_total']}  "
+              f"completed={stats['completed_total']}  "
+              f"reward={stats['cumulative_reward']:.2f}  "
+              f"energy_pc={stats['energy_per_completed']:.3f}  "
+              f"wait_avg={stats['avg_wait_ready_to_assigned']:.2f}")
+
+        print_greedy_analysis(rule_counter, reward_history, decision_count)
+    else:
+        executor.run_episode(max_steps=args.max_steps, seed=args.seed)
 
 
 def main():
@@ -624,6 +1015,12 @@ def main():
     parser.add_argument("--track-action-stats", action="store_true", default=True,
                         help="Track and print rule selection distribution after each episode "
                              "(default: False)")
+    parser.add_argument("--diag-interval", type=int, default=0,
+                        help="Print environment diagnostic every N decision steps; "
+                             "0=disabled (default: 0).  When >0 a full diagnostic "
+                             "of drone status/orders/merchants is printed at each "
+                             "interval and a greedy-vs-return analysis is shown at "
+                             "episode end.  Useful for single-episode sanity checks.")
 
     args = parser.parse_args()
 

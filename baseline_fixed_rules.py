@@ -25,12 +25,16 @@ Usage:
 
     # Run without MOPSO
     python baseline_fixed_rules.py --rule-id 0 --seed 42 --no-mopso
+
+    # Run with diagnostic output every 50 steps
+    python baseline_fixed_rules.py --rule-id 3 --seed 42 --diag-interval 50
 """
 
 import argparse
 import csv
 import os
 import sys
+from collections import Counter
 from typing import Callable
 
 import numpy as np
@@ -39,7 +43,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from UAV_ENVIRONMENT_11 import ThreeObjectiveDroneDeliveryEnv
 from U11_decentralized_execution import DecentralizedEventDrivenExecutor
-from U11_ablation import _make_env, _compute_completion_stats
+from U11_ablation import (
+    _make_env,
+    _compute_completion_stats,
+    print_env_tables,
+    print_env_diagnostic,  # backward-compatible alias for print_env_tables
+    print_greedy_analysis,
+    _run_diag_episode,
+)
 
 try:
     from U11_plotting import plot_episode_paths as _plot_episode_paths
@@ -80,6 +91,7 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
     """Run one episode with a fixed rule policy and return completion stats."""
     np.random.seed(seed)
 
+    diag_interval: int = getattr(args, 'diag_interval', 0)
     env = _make_env(args, order_cutoff_steps=0)
 
     if args.use_mopso and _HAS_MOPSO:
@@ -105,7 +117,15 @@ def run_episode(args, rule_id: int, seed: int) -> dict:
         verbose=False,
     )
 
-    executor.run_episode(max_steps=args.max_steps, seed=seed)
+    if diag_interval > 0:
+        # Print initial diagnostic then run with per-interval snapshots
+        obs, info = executor.reset(seed=seed)
+        print_env_diagnostic(env, step_label=f"rule={rule_id} seed={seed} start")
+        rule_counter, reward_history, decision_count = _run_diag_episode(
+            executor, env, args.max_steps, diag_interval, seed=None)
+        print_greedy_analysis(rule_counter, reward_history, decision_count)
+    else:
+        executor.run_episode(max_steps=args.max_steps, seed=seed)
 
     stats = _compute_completion_stats(env, executor)
     stats['seed'] = seed
@@ -172,6 +192,10 @@ def main():
                         help="Directory for trajectory plots (default: plots)")
     parser.add_argument("--plot-max-drones", type=int, default=20,
                         help="Maximum number of drone trajectories to render (default: 20)")
+    parser.add_argument("--diag-interval", type=int, default=0,
+                        help="Print environment diagnostic every N decision steps; "
+                             "0=disabled (default: 0).  Only meaningful for single-seed "
+                             "single-rule runs (use with --rule-id and one seed).")
 
     args = parser.parse_args()
 
