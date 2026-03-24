@@ -1016,6 +1016,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  hazard_midpoint_steps: float = 12.0,
                  # Waiting-time midpoint (in steps) where the hazard reaches 50% of p_max.
                  # Default 12 steps (~3 hours at 4 steps/hour) is when risk begins rising noticeably.
+                 # ===== Physics sub-stepping =====
+                 physics_substeps: int = 5,
+                 # Number of internal movement micro-steps per RL step.
+                 # Each RL step (e.g. 5 min at steps_per_hour=12) is split into this many
+                 # sub-steps so that a drone cannot silently traverse multiple waypoints
+                 # (FLYING_TO_MERCHANT → pickup → FLYING_TO_CUSTOMER) within a single
+                 # observation frame.  Total movement and energy per RL step are preserved.
+                 # Default 5 gives ~1-minute granularity when steps_per_hour=12.
                  ):
         super().__init__()
 
@@ -1112,6 +1120,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.hazard_p_max = float(hazard_p_max)
         self.hazard_k = float(hazard_k)
         self.hazard_midpoint_steps = float(hazard_midpoint_steps)
+
+        # ========== Physics sub-stepping ==========
+        self.physics_substeps = max(1, int(physics_substeps))
 
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
@@ -2938,7 +2949,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _process_events(self):
         self._update_merchant_preparation()
-        self._update_drone_positions()
+        # Split each RL step into physics_substeps micro-steps so that drones
+        # cannot silently traverse multiple waypoints within a single observation
+        # frame.  Total movement and energy per RL step are unchanged.
+        substep_scale = 1.0 / self.physics_substeps
+        for _ in range(self.physics_substeps):
+            self._update_drone_positions(speed_scale=substep_scale)
         if self.enable_random_events:
             self._handle_random_events()
 
@@ -3007,7 +3023,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if loc and drone.get('target_location') != loc:
                     drone['target_location'] = loc
 
-    def _update_drone_positions(self):
+    def _update_drone_positions(self, speed_scale: float = 1.0):
         # Sync drone status with route plan at the start of position update
         self._sync_drone_status_with_route()
 
@@ -3036,7 +3052,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     self._handle_drone_arrival(drone_id, drone)
                     continue
 
-                speed = float(drone["speed"]) * float(self._get_weather_speed_factor())
+                speed = float(drone["speed"]) * float(self._get_weather_speed_factor()) * speed_scale
                 if speed <= 1e-6:
                     continue
 
@@ -3104,7 +3120,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         self._force_return_due_to_low_battery(drone_id, drone)
 
             elif drone["status"] == DroneStatus.CHARGING:
-                self._handle_charging(drone_id, drone)
+                self._handle_charging(drone_id, drone, speed_scale=speed_scale)
 
     # ------------------ 任务/到达处理（统一结算出口）------------------
     def _stop_to_location(self, stop: dict):
@@ -3615,11 +3631,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
 
-    def _handle_charging(self, drone_id, drone):
+    def _handle_charging(self, drone_id, drone, speed_scale: float = 1.0):
         if drone['battery_level'] < 95:
             drone['battery_level'] = min(
                 drone['max_battery'],
-                drone['battery_level'] + drone['charging_rate']
+                drone['battery_level'] + drone['charging_rate'] * speed_scale
             )
         else:
             self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
