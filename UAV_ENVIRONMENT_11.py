@@ -2104,16 +2104,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _is_at_decision_point(self, drone_id: int) -> bool:
         """
-        Check if drone is at a decision point where PPO can change target.
+        Check if drone is at a decision point where the RL rule layer can change target.
 
-        KEY FIX: Allow action whenever drone needs a serving_order, not just at restrictive conditions.
-        Decision points:
+        Decision points (task-selection mode only):
         1. IDLE - drone has no work
         2. No serving_order_id - drone needs to select work
         3. Just arrived at target (close to merchant/customer) - can select next work
+
+        NOTE – Route-plan mode drones (``route_committed=True`` or non-empty
+        ``planned_stops``) are **never** RL decision points.  Their movement is
+        controlled entirely by the route plan; the RL layer must not override it.
         """
         drone = self.drones[drone_id]
         status = drone['status']
+
+        # Route-plan mode: drone autonomously follows planned_stops; RL must not interfere.
+        if drone.get('route_committed') or (
+                drone.get('planned_stops') and len(drone['planned_stops']) > 0):
+            return False
 
         # Always a decision point when IDLE
         if status == DroneStatus.IDLE:
@@ -3468,6 +3476,45 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         ]
         for key in keys_to_remove:
             drone.pop(key, None)
+
+    def _clear_drone_batch_state(self, drone: dict) -> None:
+        """Clear legacy task-selection (batch) state from a drone dict.
+
+        This codebase has **two independent drone control modes** that must not
+        be mixed for the same drone simultaneously:
+
+        **Mode A — Route-plan mode** (``apply_route_plan`` / ``append_route_plan``):
+            A full sequence of P (pickup) and D (delivery) stops is installed in
+            ``drone['planned_stops']``.  The drone autonomously executes each stop
+            via ``_set_next_target_from_plan()`` and ``_handle_drone_arrival()``
+            without requiring per-stop RL decisions.  Once a pickup succeeds the
+            drone **automatically** transitions to ``FLYING_TO_CUSTOMER`` for the
+            matching D stop — no new decision command is needed.
+
+        **Mode B — Task-selection mode** (``_process_action`` + ``serving_order_id``):
+            The RL/rule layer selects an ASSIGNED or PICKED_UP order at each
+            decision point and stores it in ``drone['serving_order_id']``.
+            ``_handle_drone_arrival()`` handles the arrival at merchant (pickup)
+            and **automatically** sets the target to the customer location
+            (``FLYING_TO_CUSTOMER``) — again no new decision command needed for
+            that automatic transition.  A new RL decision is only required when
+            the drone returns to IDLE after completing/cancelling an order.
+
+        Mode A takes priority: ``_handle_drone_arrival`` checks ``planned_stops``
+        first.  When switching a drone to Mode A (``apply_route_plan``) or fully
+        resetting it (``_safe_reset_drone``), the task-selection fields set by
+        Mode B must be cleared to prevent stale state from interfering.
+
+        Fields cleared here are the Mode-B-specific fields NOT handled by the
+        caller's own cleanup (``planned_stops``, ``cargo``, ``current_stop``,
+        ``route_committed``, and ``serving_order_id`` are handled by callers).
+        """
+        drone['serving_order_id'] = None
+        drone.pop('current_merchant_id', None)
+        for _key in ('trip_started', 'trip_actual_distance', 'trip_optimal_distance',
+                     'task_start_location', 'task_start_step',
+                     'current_task_distance', 'task_optimal_distance'):
+            drone.pop(_key, None)
 
     # ------------------ 订单完成/取消（统一走 StateManager）------------------
 
