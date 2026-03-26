@@ -11,8 +11,6 @@ import math
 from sklearn.cluster import KMeans
 
 # ===== Constants for state management =====
-ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
-DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
 
 
 # ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
@@ -1885,17 +1883,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if order['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
             return True
 
-        # Decision point if close to current target
-        if 'target_location' in drone:
-            dist_to_target = self._get_dist_to_target(drone_id)
-
-            if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
-                if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
-                    # At merchant - decision point after pickup
-                    return True
-                elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
-                    # At customer - decision point after delivery
-                    return True
+        # Decision point if drone is exactly at its current target
+        if 'target_location' in drone and drone['location'] == drone['target_location']:
+            if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
+                # At merchant - decision point after pickup
+                return True
+            elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
+                # At customer - decision point after delivery
+                return True
 
         return False
 
@@ -2505,8 +2500,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 to_target_dy = ty - cy
                 dist_to_target = float(math.sqrt(to_target_dx * to_target_dx + to_target_dy * to_target_dy))
 
-                ARRIVAL_THRESHOLD = 0.5
-                if dist_to_target <= ARRIVAL_THRESHOLD:
+                if dist_to_target == 0.0:
                     drone["location"] = (tx, ty)
                     self._handle_drone_arrival(drone_id, drone)
                     continue
@@ -2519,10 +2513,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 speed_multiplier = drone.get('ppo_speed_multiplier', 1.0)
 
                 # Move directly towards target (no heading guidance, since we removed that feature)
-                tgt_hx = to_target_dx / max(dist_to_target, 1e-6)
-                tgt_hy = to_target_dy / max(dist_to_target, 1e-6)
+                tgt_hx = to_target_dx / dist_to_target
+                tgt_hy = to_target_dy / dist_to_target
 
-                # Apply speed multiplier
+                # Apply speed multiplier; cap at dist_to_target so we never overshoot
                 step_len = min(speed * speed_multiplier, dist_to_target)
                 nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
                 ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
@@ -2547,8 +2541,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
                 drone["location"] = (nx, ny)
 
-                new_dist = float(math.sqrt((tx - nx) ** 2 + (ty - ny) ** 2))
-                if new_dist <= ARRIVAL_THRESHOLD:
+                if step_len >= dist_to_target:
                     drone["location"] = (tx, ty)
                     self._handle_drone_arrival(drone_id, drone)
 
