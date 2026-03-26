@@ -7,17 +7,13 @@ import time
 from enum import Enum
 from typing import Dict, List, Tuple, Optional, Set
 from collections import defaultdict, deque
-import matplotlib.pyplot as plt
 import math
 from sklearn.cluster import KMeans
-
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
 
 # ===== Constants for state management =====
 ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
+
 
 # ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
 
@@ -29,7 +25,7 @@ def set_global_seed(seed):
 
 # 枚举定义
 class OrderStatus(Enum):
-    PENDING = 0   # 未确定
+    PENDING = 0  # 未确定
     ACCEPTED = 1  # 接受
     PREPARING = 2  # 准备
     READY = 3
@@ -319,44 +315,36 @@ class LocationDataLoader:
 
     def _load_merchant_locations(self, csv_path):
         """加载商家位置数据"""
-        try:
-            df = pd.read_csv(csv_path)
-            locations = []
-            for _, row in df.iterrows():
-                location_str = str(row['location'])
-                if ',' in location_str:
-                    lon, lat = map(float, location_str.split(','))
-                    locations.append({
-                        'id': row['id'],
-                        'name': row['name'],
-                        'business_type': row['business_type'],
-                        'longitude': lon,
-                        'latitude': lat,
-                        'address': row.get('address', ''),
-                        'rating': row.get('rating', 4.0),
-                        'cost': row.get('cost', 30.0)
-                    })
-            return locations
-        except Exception as e:
-            print(f"加载商家位置数据失败: {e}")
-            return self._create_fallback_merchant_locations()
+        df = pd.read_csv(csv_path)
+        locations = []
+        for _, row in df.iterrows():
+            location_str = str(row['location'])
+            if ',' in location_str:
+                lon, lat = map(float, location_str.split(','))
+                locations.append({
+                    'id': row['id'],
+                    'name': row['name'],
+                    'business_type': row['business_type'],
+                    'longitude': lon,
+                    'latitude': lat,
+                    'address': row.get('address', ''),
+                    'rating': row.get('rating', 4.0),
+                    'cost': row.get('cost', 30.0)
+                })
+        return locations
 
     def _load_user_locations(self, csv_path):
         """加载用户位置数据"""
-        try:
-            df = pd.read_csv(csv_path)
-            locations = []
-            for _, row in df.iterrows():
-                locations.append({
-                    'user_id': row['user_id'],
-                    'latitude': float(row['latitude']),
-                    'longitude': float(row['longitude']),
-                    'type': row.get('type', 'user')
-                })
-            return locations
-        except Exception as e:
-            print(f"加载用户位置数据失败: {e}")
-            return self._create_fallback_user_locations()
+        df = pd.read_csv(csv_path)
+        locations = []
+        for _, row in df.iterrows():
+            locations.append({
+                'user_id': row['user_id'],
+                'latitude': float(row['latitude']),
+                'longitude': float(row['longitude']),
+                'type': row.get('type', 'user')
+            })
+        return locations
 
     def _calculate_coordinate_range(self):
         """计算经纬度范围用于坐标归一化"""
@@ -394,36 +382,6 @@ class LocationDataLoader:
             self.range_lat = 0.01
             self.range_lon = 0.01
 
-    def _create_fallback_merchant_locations(self):
-        """创建备用商家位置数据"""
-        print("使用备用商家位置数据")
-        locations = []
-        for i in range(5):
-            locations.append({
-                'id': f'B{i}',
-                'name': f'商家{i}',
-                'business_type': '餐饮',
-                'longitude': 114.92 + self.rng.uniform(-0.005, 0.005),
-                'latitude': 25.815 + self.rng.uniform(-0.005, 0.005),
-                'address': f'地址{i}',
-                'rating': self.rng.uniform(3.5, 5.0),
-                'cost': self.rng.uniform(20, 50)
-            })
-        return locations
-
-    def _create_fallback_user_locations(self):
-        """创建备用用户位置数据"""
-        print("使用备用用户位置数据")
-        locations = []
-        for i in range(50):
-            locations.append({
-                'user_id': f'user_{i:04d}',
-                'latitude': 25.815 + self.rng.uniform(-0.01, 0.01),
-                'longitude': 114.92 + self.rng.uniform(-0.01, 0.01),
-                'type': 'user'
-            })
-        return locations
-
     def convert_to_grid_coordinates(self, longitude, latitude):
         """将经纬度坐标转换为网格坐标"""
         # 归一化到 [0, 1] 范围
@@ -455,34 +413,10 @@ class LocationDataLoader:
             })
         return grid_locations
 
-    def get_random_user_grid_location(self):
-        """随机获取一个用户在网格中的位置"""
-        if not self.user_locations:
-            return self._generate_random_grid_location()
-
-        idx = int(self.rng.integers(0, len(self.user_locations)))
-        user = self.user_locations[idx]
-        grid_loc = self.convert_to_grid_coordinates(
-            user['longitude'],
-            user['latitude']
-        )
-        return grid_loc
-
-    def _generate_random_grid_location(self):
-        """生成随机网格位置（备用）"""
-        return (
-            self.rng.uniform(0, self.grid_size - 1),
-            self.rng.uniform(0, self.grid_size - 1)
-        )
-
     def find_optimal_base_locations(self, num_bases, method='kmeans'):
         """使用K-means、密度或随机寻找基站位置"""
         if method == 'kmeans':
             return self._kmeans_base_locations(num_bases)
-        elif method == 'centroid':
-            return self._centroid_base_locations(num_bases)
-        else:
-            return self._random_base_locations(num_bases)
 
     def _kmeans_base_locations(self, num_bases):
         """使用K-means聚类确定基站位置"""
@@ -534,64 +468,6 @@ class LocationDataLoader:
         print(f"K-means找到 {len(base_locations)} 个基站位置")
         return base_locations.tolist()
 
-    def _centroid_base_locations(self, num_bases):
-        """基于密度确定基站位置"""
-        # 创建网格密度图
-        density_map = np.zeros((self.grid_size, self.grid_size))
-
-        # 统计每个网格点的位置密度
-        for merchant in self.merchant_locations:
-            grid_loc = self.convert_to_grid_coordinates(
-                merchant['longitude'], merchant['latitude']
-            )
-            x, y = int(grid_loc[0]), int(grid_loc[1])
-            if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                density_map[x, y] += 2  # 商家权重更高
-
-        # 修复：按索引采样用户
-        user_sample_size = min(200, len(self.user_locations))
-        if len(self.user_locations) > 0 and user_sample_size > 0:
-            idx = self.rng.choice(np.arange(len(self.user_locations)), size=user_sample_size, replace=False)
-            sampled_users = [self.user_locations[int(i)] for i in idx]
-        else:
-            sampled_users = []
-
-        for user in sampled_users:
-            grid_loc = self.convert_to_grid_coordinates(
-                user['longitude'], user['latitude']
-            )
-            x, y = int(grid_loc[0]), int(grid_loc[1])
-            if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                density_map[x, y] += 1
-
-        # 找到密度最高的num_bases个位置
-        base_locations = []
-        for _ in range(num_bases):
-            max_idx = np.unravel_index(np.argmax(density_map), density_map.shape)
-            base_locations.append((max_idx[0] + 0.5, max_idx[1] + 0.5))  # 使用网格中心
-
-            # 将周围区域密度降低，避免基站太近
-            x, y = max_idx
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
-                        distance = np.sqrt(dx ** 2 + dy ** 2)
-                        density_map[nx, ny] *= max(0, 1 - distance / 5)
-
-        print(f"基于密度找到 {len(base_locations)} 个基站位置")
-        return base_locations
-
-    def _random_base_locations(self, num_bases):
-        """随机生成基站位置（备用方法）"""
-        base_locations = []
-        for i in range(num_bases):
-            base_locations.append((
-                self.rng.uniform(0, self.grid_size - 1),
-                self.rng.uniform(0, self.grid_size - 1)
-            ))
-        print(f"随机生成 {len(base_locations)} 个基站位置")
-        return base_locations
 
 
 # 帕累托优化器
@@ -671,31 +547,10 @@ class WeatherDataProcessor:
 
     def _load_weather_data(self, csv_path):
         """加载天气数据"""
-        try:
-            df = pd.read_csv(csv_path)
-            df['Formatted Date'] = pd.to_datetime(df['Formatted Date'], errors='coerce', utc=True)
-            df = df.dropna(subset=['Formatted Date', 'Summary', 'Temperature (C)'])
-            return df
-        except Exception as e:
-            print(f"加载天气数据失败: {e}")
-            return self._create_fallback_weather_data()
-
-    def _create_fallback_weather_data(self):
-        """创建备用天气数据"""
-        print("使用备用天气数据")
-        _rng = np.random.default_rng(0)
-        dates = pd.date_range(start='2006-01-01', end='2016-12-31', freq='h')
-        data = {
-            'Formatted Date': dates,
-            'Summary': _rng.choice(['Clear', 'Partly Cloudy', 'Cloudy', 'Rain', 'Windy', 'Fog'], len(dates)),
-            'Temperature (C)': _rng.normal(15, 10, len(dates)),
-            'Humidity': _rng.uniform(0.3, 0.9, len(dates)),
-            'Wind Speed (km/h)': _rng.exponential(10, len(dates)),
-            'Visibility (km)': _rng.uniform(5, 20, len(dates)),
-            'Pressure (millibars)': _rng.normal(1013, 10, len(dates)),
-            'Precip Type': _rng.choice(['rain', 'snow', 'none'], len(dates), p=[0.2, 0.05, 0.75])
-        }
-        return pd.DataFrame(data)
+        df = pd.read_csv(csv_path)
+        df['Formatted Date'] = pd.to_datetime(df['Formatted Date'], errors='coerce', utc=True)
+        df = df.dropna(subset=['Formatted Date', 'Summary', 'Temperature (C)'])
+        return df
 
     def get_weather_at_time(self, env_time):
         """根据环境时间获取天气数据"""
@@ -734,43 +589,25 @@ class OrderDataProcessor:
 
     def _load_order_data(self, excel_path):
         """加载订单数据"""
-        try:
-            df = pd.read_excel(excel_path)
-            required_columns = ['order_time', 'merchant_id', 'order_type', 'preparation_time', 'distance']
-            for col in required_columns:
-                if col not in df.columns:
-                    if col == 'order_time':
-                        df[col] = pd.date_range(start='2023-01-01', periods=len(df), freq='h')
-                    elif col == 'merchant_id':
-                        if self.merchant_ids:
-                            df[col] = self.rng.choice(self.merchant_ids, len(df))
-                        else:
-                            df[col] = self.rng.integers(0, self.num_merchants, len(df))
-                    elif col == 'order_type':
-                        df[col] = self.rng.choice([0, 1, 2], len(df), p=[0.8, 0.15, 0.05])
-                    elif col == 'preparation_time':
-                        df[col] = self.rng.integers(3, 10, len(df))
-                    elif col == 'distance':
-                        df[col] = self.rng.exponential(3, len(df))
-            return df
-        except Exception as e:
-            print(f"加载订单数据失败: {e}")
-            return self._create_fallback_order_data()
+        df = pd.read_excel(excel_path)
+        required_columns = ['order_time', 'merchant_id', 'order_type', 'preparation_time', 'distance']
+        for col in required_columns:
+            if col not in df.columns:
+                if col == 'order_time':
+                    df[col] = pd.date_range(start='2023-01-01', periods=len(df), freq='h')
+                elif col == 'merchant_id':
+                    if self.merchant_ids:
+                        df[col] = self.rng.choice(self.merchant_ids, len(df))
+                    else:
+                        df[col] = self.rng.integers(0, self.num_merchants, len(df))
+                elif col == 'order_type':
+                    df[col] = self.rng.choice([0, 1, 2], len(df), p=[0.8, 0.15, 0.05])
+                elif col == 'preparation_time':
+                    df[col] = self.rng.integers(3, 10, len(df))
+                elif col == 'distance':
+                    df[col] = self.rng.exponential(3, len(df))
+        return df
 
-    def _create_fallback_order_data(self):
-        """创建备用订单数据"""
-        print("使用备用订单数据")
-        dates = pd.date_range(start='2023-01-01', end='2023-12-31', freq='h')
-        data = {
-            'order_time': dates,
-            'merchant_id': self.rng.choice(self.merchant_ids, len(dates)) if self.merchant_ids else self.rng.integers(
-                0, self.num_merchants, len(dates)),
-            'order_type': self.rng.choice([0, 1, 2], len(dates), p=[0.8, 0.15, 0.05]),
-            'preparation_time': self.rng.integers(3, 10, len(dates)),
-            'distance': self.rng.exponential(3, len(dates)),
-            'is_peak': self.rng.choice([0, 1], len(dates), p=[0.7, 0.3])
-        }
-        return pd.DataFrame(data)
 
     def _analyze_order_patterns(self):
         """分析订单模式"""
@@ -981,9 +818,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  # ===== U9: Candidate-based filtering parameters =====
                  candidate_fallback_enabled: bool = True,  # Allow fallback to full active_orders if candidates empty
                  candidate_update_interval: int = 1,  # Update candidates every N steps (1=every step, 0=only on reset)
-                 # ===== Diagnostics control =====
-                 enable_diagnostics: bool = False,  # Enable detailed diagnostics for debugging
-                 diagnostics_interval: int = 64,  # Print diagnostics every N steps
                  # ===== Energy consumption model parameters =====
                  energy_e0: float = 0.1,  # Base energy consumption per unit distance (battery_units/distance_unit)
                  energy_alpha: float = 0.5,  # Load coefficient for energy consumption
@@ -1066,8 +900,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
 
         # ========== Diagnostics control ==========
-        self.enable_diagnostics = bool(enable_diagnostics)
-        self.diagnostics_interval = int(diagnostics_interval)
         self.action_applied_count = 0  # How many drones had targets updated from action this step
 
         # Cache decision points from before action execution for consistent statistics
@@ -1119,13 +951,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # ========== 三目标奖励系数（解耦版）==========
         # Obj0 (吞吐/效率): r0 = reward_a * Δcompleted
-        self.reward_a = 2.0   # completed 奖励系数
+        self.reward_a = 2.0  # completed 奖励系数
         # Obj1 (运营成本): r1 = -(reward_b * Δenergy + reward_c * Δdistance)
         self.reward_b = 0.03  # 能耗成本系数
-        self.reward_c = 0.003 # 距离成本系数
+        self.reward_c = 0.003  # 距离成本系数
         # Obj2 (服务质量): r2 = reward_d * Δon_time - reward_e * Δcancel - reward_f * log(1+backlog)
-        self.reward_d = 2.0   # 准时奖励系数
-        self.reward_e = 1.0   # 取消惩罚系数（仅 Obj2）
+        self.reward_d = 2.0  # 准时奖励系数
+        self.reward_e = 1.0  # 取消惩罚系数（仅 Obj2）
         self.reward_f = 0.02  # backlog 惩罚系数（log 饱和）
         self.heading_guidance_alpha = float(np.clip(heading_guidance_alpha, 0.0, 1.0))
         self._prev_target_dist = np.zeros(self.num_drones, dtype=np.float32)
@@ -1200,7 +1032,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'total_flight_distance': 0.0,
             'optimal_flight_distance': 0.0,
             'forced_return_events': 0,  # Track forced returns due to low battery
-            'total_waiting_time': 0,    # Cumulative (delivery_time - creation_time) for completed orders
+            'total_waiting_time': 0,  # Cumulative (delivery_time - creation_time) for completed orders
         }
 
         # Debug tracking for on_time_deliveries (to detect decreases)
@@ -1213,7 +1045,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'completed_orders': 0,
             'cancelled_orders': 0,
             'total_delivery_time': 0,
-            'total_waiting_time': 0,    # Cumulative (delivery_time - creation_time) for completed orders
+            'total_waiting_time': 0,  # Cumulative (delivery_time - creation_time) for completed orders
             'total_revenue': 0,
             'total_cost': 0,
             'energy_consumed': 0,
@@ -1789,8 +1621,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._assigned_in_step = set()
         self._last_route_heading = action
 
-        _profile = self.enable_diagnostics
-        _t0 = time.perf_counter() if _profile else 0.0
 
         day_ended = self.time_system.step()
         time_state = self.time_system.get_time_state()
@@ -1800,11 +1630,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._update_weather_from_dataset()
 
         # U7: Update candidate mappings before processing action
-        _t1 = time.perf_counter() if _profile else 0.0
         self._update_candidate_mappings()
 
         # U9: Update filtered candidates + MOPSO batch assignment based on interval
-        _t2 = time.perf_counter() if _profile else 0.0
         should_run_mopso = False
         if self.candidate_update_interval > 0:
             if self.time_system.current_step % self.candidate_update_interval == 0:
@@ -1840,7 +1668,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.last_step_reward_components['obj2_total'] = float(r_vec[2])
 
         # 动态事件 (includes position update and merchant preparation)
-        _t3 = time.perf_counter() if _profile else 0.0
         self._process_events()
 
         # 随机 sigmoid hazard 取消
@@ -1870,18 +1697,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # 更新帕累托前沿
         self.pareto_optimizer.update_pareto_front(r_vec)
-
-        # Collect profiling stats
-        if _profile:
-            _t4 = time.perf_counter()
-            _pa = self._perf_accum
-            _pa['candidate_update'] = _pa.get('candidate_update', 0.0) + (_t2 - _t1)
-            _pa['event_processing'] = _pa.get('event_processing', 0.0) + (_t4 - _t3)
-            self._perf_steps += 1
-
-        # Print diagnostics if enabled
-        if self.enable_diagnostics and self.time_system.current_step % self.diagnostics_interval == 0:
-            self._print_diagnostics()
 
         # ---- 原逻辑：termination + final bonus ----
         terminated = self._check_termination(day_ended)
@@ -2039,7 +1854,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         waiting_time = order['delivery_time'] - order['creation_time']
         self.metrics['total_waiting_time'] += waiting_time
         self.daily_stats['total_waiting_time'] = (
-            self.daily_stats.get('total_waiting_time', 0)) + waiting_time
+                                                     self.daily_stats.get('total_waiting_time', 0)) + waiting_time
 
         # Check if delivery was on-time using helper method
         if self._is_order_on_time(order):
@@ -2047,8 +1862,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.daily_stats['on_time_deliveries'] += 1
         self.active_orders.discard(order_id)
         self.completed_orders.add(order_id)
-
-
 
     # ------------------ overtime termination ------------------
 
@@ -2518,7 +2331,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Cost penalties are already applied in _calculate_three_objective_rewards
             # using actual delta_distance and delta_energy (step increments).
 
-
             # Update prev_dist for next step
             self._prev_target_dist[d] = new_dist
 
@@ -2585,7 +2397,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Track reward components for diagnostics
         self.last_step_reward_components.update({
             'obj0_completed': completed_reward,
-            'obj0_cancelled': 0.0,   # always 0: cancel penalty is Obj2-only
+            'obj0_cancelled': 0.0,  # always 0: cancel penalty is Obj2-only
             'obj1_energy_cost': -energy_cost,
             'obj1_distance_cost': -distance_cost,
             'obj2_on_time': on_time_reward,
@@ -2690,7 +2502,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._update_drone_positions(speed_scale=substep_scale)
         if self.enable_random_events:
             self._handle_random_events()
-
 
     def _update_merchant_preparation(self):
         for merchant_id, merchant in self.merchants.items():
@@ -2833,7 +2644,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
-
 
     def _handle_drone_arrival(self, drone_id, drone):
         """
@@ -3018,7 +2828,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
         self.daily_stats['total_waiting_time'] = (
-            self.daily_stats.get('total_waiting_time', 0)) + delivery_duration
+                                                     self.daily_stats.get('total_waiting_time', 0)) + delivery_duration
 
         # Calculate delivery lateness for diagnostics using helper method
         delivery_lateness = self._calculate_delivery_lateness(order)
@@ -3163,7 +2973,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 self._cancel_order(order_id, "merchant_cancellation")
 
             elif (order['status'] == OrderStatus.ASSIGNED and
-                  self.np_random.random() < self.drones[order['assigned_drone']]['cancellation_rate'] * cancellation_factor):
+                  self.np_random.random() < self.drones[order['assigned_drone']][
+                      'cancellation_rate'] * cancellation_factor):
                 self._cancel_order(order_id, "drone_cancellation")
 
             elif (order['status'] in [OrderStatus.ACCEPTED, OrderStatus.ASSIGNED] and
@@ -3297,7 +3108,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order_details = self.order_processor.generate_order_details(env_time, self.weather)
 
             if order_details['merchant_id'] not in self.merchant_ids:
-                order_details['merchant_id'] = self.merchant_ids[int(self.order_rng.integers(0, len(self.merchant_ids)))]
+                order_details['merchant_id'] = self.merchant_ids[
+                    int(self.order_rng.integers(0, len(self.merchant_ids)))]
 
             self._generate_order_with_details(order_details, order_id)
 
@@ -3503,7 +3315,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if self.daily_stats['orders_completed'] > 0:
             avg_wait = self.daily_stats['total_waiting_time'] / self.daily_stats['orders_completed']
             print(f"  平均等待时间: {avg_wait:.2f} steps")
-        #print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
+        # print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
 
         unfinished_orders = list(self.active_orders)
         for order_id in unfinished_orders:
@@ -3895,109 +3707,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _update_system_state(self):
         pass
 
-    def _print_diagnostics(self):
-        """Print detailed diagnostics for debugging PPO+MOPSO training."""
-        print(f"\n=== Diagnostics (Step {self.time_system.current_step}) ===")
-
-        # Battery and energy metrics
-        battery_levels = [drone['battery_level'] for drone in self.drones.values()]
-        avg_battery = np.mean(battery_levels) if battery_levels else 0.0
-        min_battery = np.min(battery_levels) if battery_levels else 0.0
-        print(f"  Battery: avg={avg_battery:.1f}, min={min_battery:.1f}")
-        print(f"  Energy consumed today: {self.daily_stats.get('energy_consumed', 0.0):.2f}")
-        print(f"  Forced return events: {self.daily_stats.get('forced_return_events', 0)}")
-
-        # Count drones by state
-        drones_with_serving_order = 0
-        drones_with_valid_candidates = 0
-        drones_with_assigned_candidates = 0
-        drones_with_cargo_candidates = 0
-        drones_at_decision_points = 0
-
-        for drone_id in range(self.num_drones):
-            drone = self.drones[drone_id]
-
-            # Check serving order
-            if drone.get('serving_order_id') is not None:
-                drones_with_serving_order += 1
-
-            # Check decision point
-            if self._is_at_decision_point(drone_id):
-                drones_at_decision_points += 1
-
-            # Check candidates
-            if drone_id in self.drone_candidate_mappings:
-                candidate_list = self.drone_candidate_mappings[drone_id]
-                has_valid = any(is_valid for _, is_valid in candidate_list)
-                if has_valid:
-                    drones_with_valid_candidates += 1
-
-                # Count assigned vs cargo candidates
-                for order_id, is_valid in candidate_list:
-                    if is_valid and order_id >= 0 and order_id in self.orders:
-                        order = self.orders[order_id]
-                        if order['status'] == OrderStatus.PICKED_UP:
-                            drones_with_cargo_candidates += 1
-                            break  # Count drone only once
-                for order_id, is_valid in candidate_list:
-                    if is_valid and order_id >= 0 and order_id in self.orders:
-                        order = self.orders[order_id]
-                        if order['status'] == OrderStatus.ASSIGNED:
-                            drones_with_assigned_candidates += 1
-                            break  # Count drone only once
-
-        print(f"  Drones with serving_order_id: {drones_with_serving_order}/{self.num_drones}")
-        # Use cached decision points count (from before action was processed)
-        print(f"  Drones at decision points: {self._last_decision_points_count}/{self.num_drones}")
-        print(f"  Drones with ≥1 valid candidate: {drones_with_valid_candidates}/{self.num_drones}")
-        print(f"  Drones with cargo candidates: {drones_with_cargo_candidates}/{self.num_drones}")
-        print(f"  Drones with assigned candidates: {drones_with_assigned_candidates}/{self.num_drones}")
-        print(f"  Actions applied this step: {self.action_applied_count}")
-
-        # Rule usage statistics (U8: interpretable rule-based control)
-        if self.rule_usage_stats:
-            print(f"\n  --- Rule Usage Statistics (Cumulative) ---")
-            rule_names = ["CARGO_FIRST", "ASSIGNED_EDF", "READY_EDF", "NEAREST_PICKUP", "SLACK_PER_DISTANCE"]
-            total_rule_uses = sum(self.rule_usage_stats.values())
-            for rule_id in range(self.rule_count):
-                count = self.rule_usage_stats.get(rule_id, 0)
-                pct = (count / total_rule_uses * 100) if total_rule_uses > 0 else 0.0
-                rule_name = rule_names[rule_id] if rule_id < len(rule_names) else f"Rule{rule_id}"
-                print(f"    Rule {rule_id} ({rule_name}): {count} ({pct:.1f}%)")
-
-        # Order stats - use incremental cache (always maintained, even when empty)
-        ready_count = len(self._ready_orders_cache)
-        assigned_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.ASSIGNED)
-        picked_up_count = sum(1 for oid in self.active_orders if self.orders[oid]['status'] == OrderStatus.PICKED_UP)
-
-        print(f"  Orders: READY={ready_count}, ASSIGNED={assigned_count}, PICKED_UP={picked_up_count}")
-        print(
-            f"  Orders completed: {self.daily_stats['orders_completed']}, cancelled: {self.daily_stats['orders_cancelled']}")
-
-        # Per-step performance summary (D: lightweight profiling)
-        if self._perf_steps > 0:
-            n = self._perf_steps
-            pa = self._perf_accum
-            print(f"\n  --- Avg Per-Step Timings ({n} steps) ---")
-            for key in ('candidate_update', 'event_processing'):
-                avg_ms = pa.get(key, 0.0) / n * 1000.0
-                print(f"    {key}: {avg_ms:.2f} ms/step")
-
-        # Reward component breakdown (new diagnostic)
-        print(f"\n  --- Reward Components (Last Step) ---")
-        rc = self.last_step_reward_components
-        print(f"  Obj0 (Throughput/Efficiency): {rc['obj0_total']:+.4f}")
-        print(f"    - Completed bonus: {rc['obj0_completed']:+.4f} (delta={rc['delta_completed']:.0f})")
-        print(f"    - Cancelled penalty: 0.0000 [disabled - Obj2 only]")
-        print(f"    - Progress shaping: 0.0000 [disabled]")
-        print(f"  Obj1 (Cost): {rc['obj1_total']:+.4f}")
-        print(f"    - Energy cost: {rc['obj1_energy_cost']:+.4f} (delta_energy={rc['delta_energy']:.2f})")
-        print(f"    - Distance cost: {rc['obj1_distance_cost']:+.4f} (delta_distance={rc['delta_distance']:.2f})")
-        print(f"  Obj2 (Service Quality): {rc['obj2_total']:+.4f}")
-        print(f"    - On-time reward: {rc['obj2_on_time']:+.4f}")
-        print(f"    - Cancelled penalty: {rc['obj2_cancelled']:+.4f} (delta={rc['delta_cancelled']:.0f})")
-        print(f"    - Backlog penalty (log): {rc['obj2_backlog']:+.4f}")
-        print("=" * 60)
 
     def _get_info(self):
         info = {
@@ -4018,9 +3727,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             },
             'time_state': self.time_system.get_time_state(),
             'backlog_size': len(self.active_orders),
-            # Add diagnostics statistics (consistent with strict counting)
-            'drones_at_decision_points': self._last_decision_points_count,
-            'actions_applied_this_step': self.action_applied_count,
             # Add last decision info for decentralized execution tracking
             'last_decision_drone_id': self.last_decision_info['drone_id'],
             'last_decision_rule_id': self.last_decision_info['rule_id'],
