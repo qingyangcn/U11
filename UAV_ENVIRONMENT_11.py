@@ -29,9 +29,9 @@ def set_global_seed(seed):
 
 # 枚举定义
 class OrderStatus(Enum):
-    PENDING = 0
-    ACCEPTED = 1
-    PREPARING = 2
+    PENDING = 0   # 未确定
+    ACCEPTED = 1  # 接受
+    PREPARING = 2  # 准备
     READY = 3
     ASSIGNED = 4
     PICKED_UP = 5
@@ -4960,20 +4960,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         prev_status = drone['status']
         prev_load = drone['current_load']
 
-        # MOPSO handles READY→ASSIGNED via batch assignment (task layer).
-        # RL only routes drones to already-ASSIGNED or PICKED_UP orders.
-        if order['status'] == OrderStatus.READY:
-            self.last_decision_info['failure_reason'] = 'ready_order_reserved_for_mopso'
-            return False
-
-        # Order is ASSIGNED or PICKED_UP – verify it belongs to this drone
-        if order.get('assigned_drone', -1) != drone_id:
-            self.last_decision_info['failure_reason'] = 'order_not_assigned_to_this_drone'
-            return False
-
         # Set serving_order_id and target
         drone['serving_order_id'] = order_id
-
         # Determine target based on order status
         if order['status'] == OrderStatus.PICKED_UP:
             # Deliver to customer

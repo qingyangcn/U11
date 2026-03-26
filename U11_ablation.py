@@ -437,6 +437,7 @@ def load_trained_policy(model_path: str, vecnormalize_path: str = None):
         else:
             obs_to_predict = local_obs
         action, _ = model.predict(obs_to_predict, deterministic=True)
+        print(action)
         return int(action)
 
     return policy_fn

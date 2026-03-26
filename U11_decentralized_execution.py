@@ -463,4 +463,5 @@ class DecentralizedEventDrivenExecutor:
 
             if terminated or truncated:
                 break
+
         return self.get_statistics()
