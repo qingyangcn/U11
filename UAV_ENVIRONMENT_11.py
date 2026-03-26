@@ -275,18 +275,6 @@ class StateManager:
         return categories
 
 
-    def _order_in_planned_stops(self, order_id, planned_stops):
-        """Check if an order appears in the planned stops (D stop)"""
-        for stop in planned_stops:
-            if stop.get('type') == 'D' and stop.get('order_id') == order_id:
-                return True
-        return False
-
-    def _has_delivery_stop(self, order_id, planned_stops):
-        """Check if a delivery stop exists for the order"""
-        return self._order_in_planned_stops(order_id, planned_stops)
-
-
 # 路径规划可视化类
 class PathVisualizer:
     def __init__(self, grid_size):
@@ -1021,8 +1009,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  # Number of internal movement micro-steps per RL step.
                  # Each RL step (e.g. 5 min at steps_per_hour=12) is split into this many
                  # sub-steps so that a drone cannot silently traverse multiple waypoints
-                 # (FLYING_TO_MERCHANT → pickup → FLYING_TO_CUSTOMER) within a single
-                 # observation frame.  Total movement and energy per RL step are preserved.
+                 # within a single observation frame.  Total movement and energy per RL step
+                 # are preserved.
                  # Default 5 gives ~1-minute granularity when steps_per_hour=12.
                  ):
         super().__init__()
@@ -1382,12 +1370,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'charging_rate': 10.0,
                 'cancellation_rate': 0.005,
                 'total_distance_today': 0.0,
-                'planned_stops': deque(),
-                # deque of stops: {'type':'P','merchant_id':mid} or {'type':'D','order_id':oid}
                 'cargo': set(),  # picked-up orders (order_ids) not yet delivered
-                'current_stop': None,
-                'route_committed': False,
-                'serving_order_id': None,  # U7 task-selection: currently executing order
+                'serving_order_id': None,  # task-selection: currently executing order
             }
             self.bases[base_id]['drones_available'].append(i)
 
@@ -1977,16 +1961,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'cancellation_rate': self.np_random.uniform(0.005, 0.015),
                 'total_distance_today': 0.0,
             }
-            self.drones[i]['planned_stops'] = deque()
             self.drones[i]['cargo'] = set()
-            self.drones[i]['current_stop'] = None
-            self.drones[i]['route_committed'] = False
-            self.drones[i]['serving_order_id'] = None  # U7 task-selection state
+            self.drones[i]['serving_order_id'] = None  # task-selection state
             keys_to_remove = ['task_start_location', 'task_start_step', 'accumulated_distance',
                               'optimal_distance', 'last_location', 'target_location',
                               'route_preferences',
                               'current_task_distance', 'task_optimal_distance', 'trip_started',
-                              'trip_actual_distance', 'trip_optimal_distance']
+                              'trip_actual_distance', 'trip_optimal_distance',
+                              'current_merchant_id', 'current_stop',
+                              'planned_stops', 'route_committed']
             for key in keys_to_remove:
                 self.drones[i].pop(key, None)
 
@@ -2104,31 +2087,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _is_at_decision_point(self, drone_id: int) -> bool:
         """
-        Check if drone is at a decision point where the RL rule layer can change target.
+        Check if drone is at a decision point where the RL rule layer can issue a command.
 
-        Decision points (task-selection mode only):
-        1. IDLE - drone has no work
+        Decision points:
+        1. IDLE - drone has no active work (includes just-arrived-at-merchant after pickup)
         2. No serving_order_id - drone needs to select work
-        3. Just arrived at target (close to merchant/customer) - can select next work
-
-        NOTE – Route-plan mode drones (``route_committed=True`` or non-empty
-        ``planned_stops``) are **never** RL decision points.  Their movement is
-        controlled entirely by the route plan; the RL layer must not override it.
+        3. Just arrived at merchant or customer (close to target) - ready for next command
         """
         drone = self.drones[drone_id]
         status = drone['status']
-
-        # Route-plan mode: drone autonomously follows planned_stops; RL must not interfere.
-        if drone.get('route_committed') or (
-                drone.get('planned_stops') and len(drone['planned_stops']) > 0):
-            return False
 
         # Always a decision point when IDLE
         if status == DroneStatus.IDLE:
             return True
 
-        # KEY FIX: Allow action whenever drone doesn't have a valid serving_order_id
-        # This ensures drones can get work assigned even while flying
+        # Allow action whenever drone doesn't have a valid serving_order_id
         serving_order_id = drone.get('serving_order_id')
         if serving_order_id is None:
             return True
@@ -2142,11 +2115,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if order['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
             return True
 
-        # Decision point if we just completed a pickup or delivery (arrived at target)
+        # Decision point if close to current target
         if 'target_location' in drone:
             dist_to_target = self._get_dist_to_target(drone_id)
 
-            # If very close to target and in appropriate status
             if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
                 if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
                     # At merchant - decision point after pickup
@@ -2429,27 +2401,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             order = self.orders[order_id]
 
-            # If the drone already has PICKED_UP cargo that must be delivered first,
-            # and PPO selected a *different* order (not one of those cargo items),
-            # skip the new assignment and restore the delivery chain if needed.
-            picked_up_in_cargo = [
-                oid for oid in drone.get('cargo', set())
-                if oid in self.orders and self.orders[oid]['status'] == OrderStatus.PICKED_UP
-            ]
-            if picked_up_in_cargo and order_id not in picked_up_in_cargo:
-                # Restore serving_order_id / FLYING_TO_CUSTOMER if currently broken
-                current_serving = drone.get('serving_order_id')
-                if current_serving not in picked_up_in_cargo:
-                    target_oid = picked_up_in_cargo[0]
-                    drone['serving_order_id'] = target_oid
-                    target_order = self.orders[target_oid]
-                    customer_loc = target_order.get('customer_location')
-                    if customer_loc:
-                        self.state_manager.update_drone_status(
-                            drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
-                        )
-                continue
-
             # Track state before changes to detect if action actually applied
             state_changed = False
 
@@ -2671,235 +2622,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         return bonus
 
-    # ------------------ MPSO 分配相关：保留接口但不从 action 中学习 ------------------
-
-    def apply_route_plan(self,
-                         drone_id: int,
-                         planned_stops: List[dict],
-                         commit_orders: Optional[List[int]] = None,
-                         allow_busy: bool = True) -> bool:
-        """
-        Apply a cross-merchant interleaved route plan.
-        planned_stops:
-            [{'type':'P','merchant_id':mid}, {'type':'D','order_id':oid}, ...]
-        Constraints (per your requirement):
-            - planned_stops must not include orders that are not READY at dispatch time.
-            - Pickup is executed only when arriving at that merchant stop.
-            - Delivery is executed only when arriving at that delivery stop.
-
-        Commit semantics:
-            commit_orders are moved READY -> ASSIGNED and assigned to this drone.
-            Orders are NOT marked PICKED_UP at commit time.
-
-        Returns:
-            bool: True if route was successfully applied, False otherwise.
-        """
-        if drone_id not in self.drones:
-            return False
-        drone = self.drones[drone_id]
-
-        if (not allow_busy) and drone['status'] != DroneStatus.IDLE:
-            return False
-
-        # Derive commit_orders if not provided
-        if commit_orders is None:
-            commit_orders = []
-            for st in planned_stops:
-                if st.get('type') == 'D' and 'order_id' in st:
-                    commit_orders.append(int(st['order_id']))
-            # unique, keep order
-            commit_orders = list(dict.fromkeys(commit_orders))
-
-        # 1) Commit orders: only READY orders are allowed
-        committed = []
-        for oid in commit_orders:
-            o = self.orders.get(oid)
-            if o is None:
-                continue
-
-            # Enforced by requirement: only READY can be in planned_stops/commit list
-            if o['status'] != OrderStatus.READY:
-                continue
-            if o.get('assigned_drone', -1) not in (-1, None):
-                continue
-            if drone['current_load'] >= drone['max_capacity']:
-                break
-
-            self.state_manager.update_order_status(oid, OrderStatus.ASSIGNED, reason=f"route_committed_{drone_id}")
-            o['assigned_drone'] = drone_id
-            drone['current_load'] += 1
-            committed.append(oid)
-
-            # Record READY-based assignment slack for diagnostics
-            deadline_step = self._get_delivery_deadline_step(o)
-            assignment_slack = deadline_step - self.time_system.current_step
-            self.metrics['assignment_slack_samples'].append(assignment_slack)
-            # Record wait time from READY to assignment
-            _rdy = o.get('ready_step')
-            if _rdy is not None:
-                self.metrics['wait_ready_to_assigned_samples'].append(
-                    self.time_system.current_step - _rdy)
-
-        if not committed:
-            return False
-
-        # Task C: Validate that orders in planned_stops are in committed set
-        # and filter out D stops for non-committed orders
-        committed_set = set(committed)
-        filtered_stops = []
-        for stop in planned_stops:
-            if stop.get('type') == 'D':
-                oid = stop.get('order_id')
-                if oid is not None and oid not in committed_set:
-                    if self.debug_state_warnings:
-                        print(f"[Warning] Drone {drone_id} skipping D stop for uncommitted order {oid}")
-                    continue  # Skip this D stop
-            filtered_stops.append(stop)
-
-        # If no stops remain after filtering, don't install route
-        if not filtered_stops:
-            if self.debug_state_warnings:
-                print(f"[Warning] Drone {drone_id} route empty after filtering - no valid D stops")
-            return False
-
-        # 2) Install route plan with filtered stops
-        drone['planned_stops'] = deque(filtered_stops)
-        drone['cargo'] = set()  # picked-up set starts empty
-        drone['current_stop'] = None
-        drone['route_committed'] = True
-
-        # Clear legacy batch state to avoid conflicts with route-plan mode
-        self._clear_drone_batch_state(drone)
-
-        # 3) Start execution: set target to the first stop
-        self._set_next_target_from_plan(drone_id, drone)
-
-        return True
-
-    def append_route_plan(self,
-                          drone_id: int,
-                          planned_stops: List[dict],
-                          commit_orders: Optional[List[int]] = None) -> bool:
-        """
-        Append additional stops to a drone's existing route plan without interrupting current execution.
-
-        This method allows assigning additional orders to drones that have remaining capacity
-        but are currently busy executing a route. Unlike apply_route_plan which replaces
-        the entire route, this method safely extends the existing route.
-
-        Args:
-            drone_id: ID of the drone to extend
-            planned_stops: List of stops to append [{'type':'P','merchant_id':mid}, {'type':'D','order_id':oid}, ...]
-            commit_orders: Optional list of order IDs to commit (if None, derived from planned_stops)
-
-        Returns:
-            bool: True if route was successfully extended, False otherwise
-
-        Constraints:
-            - Only READY orders can be committed
-            - Drone must have remaining capacity (current_load < max_capacity)
-            - Does not reset existing cargo or planned_stops
-            - Does not interrupt current target if drone is already executing a route
-        """
-        if drone_id not in self.drones:
-            return False
-        drone = self.drones[drone_id]
-
-        # Check if drone has remaining capacity
-        if drone['current_load'] >= drone['max_capacity']:
-            return False
-
-        # Derive commit_orders if not provided
-        if commit_orders is None:
-            commit_orders = []
-            for st in planned_stops:
-                if st.get('type') == 'D' and 'order_id' in st:
-                    commit_orders.append(int(st['order_id']))
-            # unique, keep order
-            commit_orders = list(dict.fromkeys(commit_orders))
-
-        # 1) Commit orders: only READY orders are allowed
-        committed = []
-        for oid in commit_orders:
-            o = self.orders.get(oid)
-            if o is None:
-                continue
-
-            # Only READY can be in planned_stops/commit list
-            if o['status'] != OrderStatus.READY:
-                continue
-            if o.get('assigned_drone', -1) not in (-1, None):
-                continue
-            if drone['current_load'] >= drone['max_capacity']:
-                break
-
-            self.state_manager.update_order_status(oid, OrderStatus.ASSIGNED, reason=f"route_append_{drone_id}")
-            o['assigned_drone'] = drone_id
-            drone['current_load'] += 1
-            committed.append(oid)
-
-            # Record READY-based assignment slack for diagnostics
-            deadline_step = self._get_delivery_deadline_step(o)
-            assignment_slack = deadline_step - self.time_system.current_step
-            self.metrics['assignment_slack_samples'].append(assignment_slack)
-            # Record wait time from READY to assignment
-            _rdy = o.get('ready_step')
-            if _rdy is not None:
-                self.metrics['wait_ready_to_assigned_samples'].append(
-                    self.time_system.current_step - _rdy)
-
-        if not committed:
-            return False
-
-        # Validate and filter stops
-        committed_set = set(committed)
-        filtered_stops = []
-        for stop in planned_stops:
-            if stop.get('type') == 'D':
-                oid = stop.get('order_id')
-                if oid is not None and oid not in committed_set:
-                    if self.debug_state_warnings:
-                        print(f"[Warning] Drone {drone_id} append skipping D stop for uncommitted order {oid}")
-                    continue
-            filtered_stops.append(stop)
-
-        if not filtered_stops:
-            if self.debug_state_warnings:
-                print(f"[Warning] Drone {drone_id} append route empty after filtering - no valid stops")
-            return False
-
-        # 2) Append stops to existing route (don't replace!)
-        # Track count of stops before appending to determine if we should start execution
-        existing_stops_count = 0
-
-        # Initialize planned_stops if it doesn't exist
-        if 'planned_stops' not in drone or drone['planned_stops'] is None:
-            drone['planned_stops'] = deque()
-        else:
-            existing_stops_count = len(drone['planned_stops'])
-
-        # Append new stops to the end of existing route
-        for stop in filtered_stops:
-            drone['planned_stops'].append(stop)
-
-        # Initialize cargo if needed (don't reset!)
-        if 'cargo' not in drone or drone['cargo'] is None:
-            drone['cargo'] = set()
-
-        # Mark route as committed
-        drone['route_committed'] = True
-
-        # 3) Start execution only if this is the first route assignment
-        # If drone already has planned_stops and is executing, don't interrupt
-        # Only set next target if drone is idle or had no stops before appending
-        if drone['status'] == DroneStatus.IDLE or existing_stops_count == 0:
-            # Drone was idle or we just added the first stops - start execution
-            self._set_next_target_from_plan(drone_id, drone)
-
-        return True
-
-
-
     def _process_single_assignment(self, drone_id, order_id, allow_busy=False):
         """处理单个订单分配（记录任务起点 + 走 StateManager）"""
         if order_id not in self.orders or drone_id not in self.drones:
@@ -2997,47 +2719,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order_id in merchant['queue']:
                     merchant['queue'].remove(order_id)
 
-    def _sync_drone_status_with_route(self):
-        """
-        Synchronize drone status with route plan (Task A).
-        Called at the start of each step to ensure drone status matches planned_stops.
-        """
-        for drone_id, drone in self.drones.items():
-            planned_stops = drone.get('planned_stops')
-            if not planned_stops or len(planned_stops) == 0:
-                # No planned stops - allow IDLE or RETURNING
-                continue
-
-            # Get first stop
-            stop = planned_stops[0]
-            stop_type = stop.get('type')
-
-            if stop_type == 'P':
-                # Pickup stop - should be FLYING_TO_MERCHANT
-                expected_status = DroneStatus.FLYING_TO_MERCHANT
-                loc = self._stop_to_location(stop)
-                if loc and drone['status'] != expected_status:
-                    self.state_manager.update_drone_status(drone_id, expected_status, target_location=loc)
-                    drone['current_merchant_id'] = stop.get('merchant_id')
-                # Ensure target_location matches stop location
-                if loc and drone.get('target_location') != loc:
-                    drone['target_location'] = loc
-
-            elif stop_type == 'D':
-                # Delivery stop - should be FLYING_TO_CUSTOMER
-                expected_status = DroneStatus.FLYING_TO_CUSTOMER
-                loc = self._stop_to_location(stop)
-                if loc and drone['status'] != expected_status:
-                    self.state_manager.update_drone_status(drone_id, expected_status, target_location=loc)
-                    drone['current_order_id'] = stop.get('order_id')
-                # Ensure target_location matches stop location
-                if loc and drone.get('target_location') != loc:
-                    drone['target_location'] = loc
-
     def _update_drone_positions(self, speed_scale: float = 1.0):
-        # Sync drone status with route plan at the start of position update
-        self._sync_drone_status_with_route()
-
         for drone_id, drone in self.drones.items():
             self.path_visualizer.update_path_history(drone_id, drone["location"])
 
@@ -3134,115 +2816,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 self._handle_charging(drone_id, drone, speed_scale=speed_scale)
 
     # ------------------ 任务/到达处理（统一结算出口）------------------
-    def _stop_to_location(self, stop: dict):
-        """Map a planned stop to a concrete target location."""
-        stype = stop.get('type', None)
-        if stype == 'P':
-            mid = stop.get('merchant_id', None)
-            if mid is None or mid not in self.merchants:
-                return None
-            return self.merchants[mid]['location']
-        if stype == 'D':
-            oid = stop.get('order_id', None)
-            if oid is None or oid not in self.orders:
-                return None
-            return self.orders[oid]['customer_location']
-        return None
-
-    def _set_next_target_from_plan(self, drone_id: int, drone: dict) -> None:
-        """
-        Pop invalid stops until a valid target is found; then set drone target/status.
-        If no stop remains, reset/return-to-base.
-        Task C: Add validation for stop/order consistency.
-        """
-        while drone.get('planned_stops') and len(drone['planned_stops']) > 0:
-            stop = drone['planned_stops'][0]
-            loc = self._stop_to_location(stop)
-            if loc is None:
-                if self.debug_state_warnings:
-                    print(f"[Drone {drone_id}] 无效 stop (location not found): {stop}")
-                drone['planned_stops'].popleft()
-                continue
-
-            # Task C: Validate D stops reference valid orders
-            if stop.get('type') == 'D':
-                oid = stop.get('order_id')
-                if oid is not None and oid in self.orders:
-                    o = self.orders[oid]
-                    # Check if order is valid for delivery
-                    if o.get('assigned_drone') != drone_id:
-                        if self.debug_state_warnings:
-                            print(f"[Drone {drone_id}] D stop {oid} 不属于该无人机，跳过")
-                        drone['planned_stops'].popleft()
-                        continue
-                    if o['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
-                        if self.debug_state_warnings:
-                            print(f"[Drone {drone_id}] D stop {oid} 订单已取消或已送达，跳过")
-                        drone['planned_stops'].popleft()
-                        continue
-                    # 硬约束：只有已取货的订单才能飞往顾客
-                    # 若订单尚未 PICKED_UP（如仍为 ASSIGNED），则继续等待取货而非直飞顾客
-                    if o['status'] != OrderStatus.PICKED_UP:
-                        if self.debug_state_warnings:
-                            print(f"[Drone {drone_id}] D stop {oid} 订单未取货(status={o['status']})，跳过，等待取货")
-                        drone['planned_stops'].popleft()
-                        continue
-
-            drone['current_stop'] = stop
-            self._start_new_task(drone_id, drone, loc)
-
-            if stop.get('type') == 'P':
-                self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=loc)
-            else:
-                self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=loc)
-            return
-
-        # No stops left: end this route cleanly
-        self._safe_reset_drone(drone_id, drone)
-
-    def _execute_pickup_stop(self, drone_id: int, drone: dict, stop: dict) -> None:
-        """
-        Arrive at merchant mid: pick up only orders assigned to this drone AND belonging to this merchant.
-        READY-only planning: orders should already be ASSIGNED here, but we still check status strictly.
-        """
-        mid = stop.get('merchant_id', None)
-        if mid is None:
-            return
-
-        for oid in list(self.active_orders):
-            o = self.orders.get(oid)
-            if o is None:
-                continue
-            if o.get('assigned_drone', -1) != drone_id:
-                continue
-            if o.get('merchant_id', None) != mid:
-                continue
-            if o['status'] != OrderStatus.ASSIGNED:
-                continue
-
-            self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP, reason=f"pickup_at_merchant_{mid}")
-            o['pickup_time'] = self.time_system.current_step
-            drone['cargo'].add(oid)
-
-    def _execute_delivery_stop(self, drone_id: int, drone: dict, stop: dict) -> None:
-        """Arrive at customer: deliver exactly the specified order (must be PICKED_UP)."""
-        oid = stop.get('order_id', None)
-        if oid is None or oid not in self.orders:
-            return
-
-        o = self.orders[oid]
-        if o.get('assigned_drone', -1) != drone_id:
-            return
-
-        # Strict legality for READY-only planning: must have been picked up at its merchant stop
-        if o['status'] != OrderStatus.PICKED_UP:
-            return
-
-        self._complete_order_delivery(oid, drone_id)
-
-        if oid in drone.get('cargo', set()):
-            drone['cargo'].remove(oid)
-
     def _safe_reset_drone(self, drone_id, drone):
         """唯一出口：清理关联订单 + 返航"""
 
@@ -3253,70 +2826,25 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 elif order['status'] == OrderStatus.ASSIGNED:
                     self._reset_order_to_ready(order_id, "drone_reset")
 
-        self._clear_drone_batch_state(drone)
-        # --- ADD: clear planned route data ---
-        drone['planned_stops'] = deque()
         drone['cargo'] = set()
-        drone['current_stop'] = None
-        drone['route_committed'] = False
-        drone['serving_order_id'] = None  # Clear task-selection state
+        drone['serving_order_id'] = None
+        drone.pop('current_merchant_id', None)
         # 返航（返航不计入整趟，因为 trip 字段已清理）
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
 
-    def _restore_next_delivery(self, drone_id: int, drone: dict) -> bool:
-        """After a blocked IDLE transition, restore delivery state for remaining PICKED_UP cargo.
-
-        Scans *drone['cargo']* for the first order that is still PICKED_UP and assigned
-        to this drone, then sets *serving_order_id* and transitions the drone to
-        FLYING_TO_CUSTOMER.  Returns True if a pending delivery was found and wired up,
-        False if the cargo is empty (or no valid PICKED_UP order remains).
-        """
-        cargo = drone.get('cargo', set())
-        for oid in cargo:
-            if oid not in self.orders:
-                continue
-            order = self.orders[oid]
-            if (order['status'] == OrderStatus.PICKED_UP and
-                    order.get('assigned_drone') == drone_id):
-                customer_loc = order.get('customer_location')
-                if customer_loc:
-                    drone['serving_order_id'] = oid
-                    self.state_manager.update_drone_status(
-                        drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
-                    )
-                    return True
-        return False
-
 
     def _handle_drone_arrival(self, drone_id, drone):
         """
-        Arrival handler:
-          - If planned_stops is present: execute interleaved multi-merchant pickup/delivery.
-          - Else if serving_order_id is present: task-selection mode logic.
-          - Else: drone arrived without a plan – reset to base.
+        Arrival handler (task-selection mode).
+
+        - FLYING_TO_MERCHANT: perform pickup, then go IDLE and wait for RL decision.
+        - FLYING_TO_CUSTOMER: perform delivery, then go IDLE.
+        - No serving_order_id: reset to base.
+        - RETURNING_TO_BASE: land, charge or idle.
         """
-        # -------- Route-plan logic (priority) --------
-        if drone.get('planned_stops') and len(drone['planned_stops']) > 0:
-            stop = drone['planned_stops'][0]
-            stype = stop.get('type', None)
-
-            if stype == 'P':
-                self._execute_pickup_stop(drone_id, drone, stop)
-                drone['planned_stops'].popleft()
-                return self._set_next_target_from_plan(drone_id, drone)
-
-            if stype == 'D':
-                self._execute_delivery_stop(drone_id, drone, stop)
-                drone['planned_stops'].popleft()
-                return self._set_next_target_from_plan(drone_id, drone)
-
-            # Unknown stop type -> drop and continue
-            drone['planned_stops'].popleft()
-            return self._set_next_target_from_plan(drone_id, drone)
-
-        # -------- Task-selection mode logic (U7) --------
+        # -------- Task-selection mode logic --------
         serving_order_id = drone.get('serving_order_id')
         if serving_order_id is not None and serving_order_id in self.orders:
             order = self.orders[serving_order_id]
@@ -3337,38 +2865,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             order['pickup_time'] = self.time_system.current_step
                             drone['cargo'].add(serving_order_id)
 
-                            # Set target to customer and transition status
-                            customer_loc = order.get('customer_location')
-                            if customer_loc:
-                                self.state_manager.update_drone_status(
-                                    drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
-                                )
-                            else:
-                                # Pickup succeeded but customer location is missing – undo pickup
-                                # so the order can be re-routed rather than leaving the drone IDLE
+                            # Validate customer location is present
+                            if not order.get('customer_location'):
+                                # No delivery target – undo pickup, release order back to READY
                                 drone['cargo'].discard(serving_order_id)
                                 self._reset_order_to_ready(serving_order_id,
                                                            "task_selection_no_customer_location")
-                                # Atomically clear serving_order_id: only after IDLE succeeds;
-                                # if IDLE is blocked by other PICKED_UP cargo, restore delivery.
-                                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
-                                                                              target_location=None):
-                                    if not self._restore_next_delivery(drone_id, drone):
-                                        drone['serving_order_id'] = None
-                                else:
-                                    drone['serving_order_id'] = None
+
+                            # Pickup complete – go IDLE and wait for RL decision
+                            self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                                   target_location=None)
+                            drone['serving_order_id'] = None
                             return
 
-                # If we couldn't perform pickup, release the ASSIGNED order back to READY
-                # so it can be re-assigned to another drone.
+                # Pickup failed – release the ASSIGNED order back to READY
                 if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.ASSIGNED:
                     self._reset_order_to_ready(serving_order_id, "task_selection_pickup_failed")
-                # Atomically clear serving_order_id after IDLE transition.
-                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None):
-                    if not self._restore_next_delivery(drone_id, drone):
-                        drone['serving_order_id'] = None
-                else:
-                    drone['serving_order_id'] = None
+                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                drone['serving_order_id'] = None
 
             elif drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
                 # Arrived at customer - perform delivery
@@ -3384,42 +2898,29 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         if serving_order_id in drone['cargo']:
                             drone['cargo'].remove(serving_order_id)
 
-                        # Atomically clear serving_order_id: only after IDLE succeeds.
-                        # If IDLE is blocked (other PICKED_UP cargo), restore next delivery.
-                        if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
-                                                                      target_location=None):
-                            if not self._restore_next_delivery(drone_id, drone):
-                                drone['serving_order_id'] = None
-                        else:
-                            drone['serving_order_id'] = None
+                        # Go IDLE and wait for RL decision
+                        self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                               target_location=None)
+                        drone['serving_order_id'] = None
                         return
 
-                # If we couldn't deliver, release the PICKED_UP order back to READY
-                # so it can be re-routed to another drone.
+                # Delivery failed – release the PICKED_UP order back to READY
                 if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.PICKED_UP:
                     drone.get('cargo', set()).discard(serving_order_id)
                     self._reset_order_to_ready(serving_order_id, "task_selection_delivery_failed")
-                # Atomically clear serving_order_id after IDLE transition.
-                if not self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None):
-                    if not self._restore_next_delivery(drone_id, drone):
-                        drone['serving_order_id'] = None
-                else:
-                    drone['serving_order_id'] = None
+                self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                drone['serving_order_id'] = None
 
             return
 
-        # -------- No active route or serving order --------
-        # Drone arrived without a task assignment.  For FLYING_TO_MERCHANT or
-        # FLYING_TO_CUSTOMER with no context, reset and return to base.
+        # -------- No serving order --------
+        # Drone arrived without a task assignment.
         if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.FLYING_TO_CUSTOMER]:
             self._safe_reset_drone(drone_id, drone)
             return
 
         if drone['status'] == DroneStatus.RETURNING_TO_BASE:
-            # Defensive: resolve any PICKED_UP/ASSIGNED orders that are still linked
-            # to this drone before we clear its state.  This guards against cases
-            # where the send-to-base path did not fully clean up (e.g. task-selection
-            # edge paths, direct status transitions, etc.).
+            # Defensive: resolve any PICKED_UP/ASSIGNED orders still linked to this drone.
             for oid in list(self.active_orders):
                 if oid not in self.orders:
                     continue
@@ -3438,11 +2939,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone['current_load'] = 0
             self._clear_task_data(drone_id, drone)
 
-            # Clear route-plan state and record trajectory break
-            drone['planned_stops'] = deque()
             drone['cargo'] = set()
-            drone['current_stop'] = None
-            drone['route_committed'] = False
             drone['serving_order_id'] = None
             # 无人机返回基站落地：在轨迹中插入断点，避免下次出发时与本次路径相连
             self.path_visualizer.break_segment(drone_id)
@@ -3476,45 +2973,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         ]
         for key in keys_to_remove:
             drone.pop(key, None)
-
-    def _clear_drone_batch_state(self, drone: dict) -> None:
-        """Clear legacy task-selection (batch) state from a drone dict.
-
-        This codebase has **two independent drone control modes** that must not
-        be mixed for the same drone simultaneously:
-
-        **Mode A — Route-plan mode** (``apply_route_plan`` / ``append_route_plan``):
-            A full sequence of P (pickup) and D (delivery) stops is installed in
-            ``drone['planned_stops']``.  The drone autonomously executes each stop
-            via ``_set_next_target_from_plan()`` and ``_handle_drone_arrival()``
-            without requiring per-stop RL decisions.  Once a pickup succeeds the
-            drone **automatically** transitions to ``FLYING_TO_CUSTOMER`` for the
-            matching D stop — no new decision command is needed.
-
-        **Mode B — Task-selection mode** (``_process_action`` + ``serving_order_id``):
-            The RL/rule layer selects an ASSIGNED or PICKED_UP order at each
-            decision point and stores it in ``drone['serving_order_id']``.
-            ``_handle_drone_arrival()`` handles the arrival at merchant (pickup)
-            and **automatically** sets the target to the customer location
-            (``FLYING_TO_CUSTOMER``) — again no new decision command needed for
-            that automatic transition.  A new RL decision is only required when
-            the drone returns to IDLE after completing/cancelling an order.
-
-        Mode A takes priority: ``_handle_drone_arrival`` checks ``planned_stops``
-        first.  When switching a drone to Mode A (``apply_route_plan``) or fully
-        resetting it (``_safe_reset_drone``), the task-selection fields set by
-        Mode B must be cleared to prevent stale state from interfering.
-
-        Fields cleared here are the Mode-B-specific fields NOT handled by the
-        caller's own cleanup (``planned_stops``, ``cargo``, ``current_stop``,
-        ``route_committed``, and ``serving_order_id`` are handled by callers).
-        """
-        drone['serving_order_id'] = None
-        drone.pop('current_merchant_id', None)
-        for _key in ('trip_started', 'trip_actual_distance', 'trip_optimal_distance',
-                     'task_start_location', 'task_start_step',
-                     'current_task_distance', 'task_optimal_distance'):
-            drone.pop(_key, None)
 
     # ------------------ 订单完成/取消（统一走 StateManager）------------------
 
@@ -3669,12 +3127,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order_id in drone.get('cargo', set()):
                     drone['cargo'].discard(order_id)
 
-        # Clear drone route/task state
-        drone['planned_stops'] = deque()
+        # Clear drone task state
         drone['cargo'] = set()
-        drone['current_stop'] = None
-        drone['route_committed'] = False
         drone['serving_order_id'] = None
+        drone.pop('current_merchant_id', None)
         drone['current_load'] = 0
 
         # Set drone to return to base
@@ -4706,7 +4162,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'max_capacity': drone['max_capacity'],
                 'speed': drone['speed'],
                 'battery_consumption_rate': drone['battery_consumption_rate'],
-                'has_route': drone.get('route_committed', False),
                 'can_accept_more': drone['current_load'] < drone['max_capacity'],
             }
             drones_snapshot.append(snapshot)
