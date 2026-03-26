@@ -11,8 +11,6 @@ import math
 from sklearn.cluster import KMeans
 
 # ===== Constants for state management =====
-ARRIVAL_THRESHOLD = 0.0  # Distance threshold for considering drone arrived at target
-DISTANCE_CLOSE_THRESHOLD = 0.0  # Distance threshold for decision point detection
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -1853,45 +1851,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         Check if drone is at a decision point where the RL rule layer can issue a command.
 
-        Decision points:
-        1. IDLE - drone has no active work (includes just-arrived-at-merchant after pickup)
-        2. No serving_order_id - drone needs to select work
-        3. Just arrived at merchant or customer (close to target) - ready for next command
+        Decision points: IDLE, which covers idle, pickup complete, delivery complete,
+        and charging complete (all transitions end in IDLE).
         """
-        drone = self.drones[drone_id]
-        status = drone['status']
-
-        # Always a decision point when IDLE
-        if status == DroneStatus.IDLE:
-            return True
-
-        # Allow action whenever drone doesn't have a valid serving_order_id
-        serving_order_id = drone.get('serving_order_id')
-        if serving_order_id is None:
-            return True
-
-        # Check if serving_order is still valid
-        if serving_order_id not in self.orders:
-            return True
-
-        order = self.orders[serving_order_id]
-        # If serving_order is cancelled or delivered, need new work
-        if order['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
-            return True
-
-        # Decision point if close to current target
-        if 'target_location' in drone:
-            dist_to_target = self._get_dist_to_target(drone_id)
-
-            if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
-                if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
-                    # At merchant - decision point after pickup
-                    return True
-                elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
-                    # At customer - decision point after delivery
-                    return True
-
-        return False
+        return self.drones[drone_id]['status'] == DroneStatus.IDLE
 
     # ------------------ U8: Rule-based order selection ------------------
 
@@ -2499,9 +2462,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 to_target_dy = ty - cy
                 dist_to_target = float(math.sqrt(to_target_dx * to_target_dx + to_target_dy * to_target_dy))
 
-                ARRIVAL_THRESHOLD = 0.5
-                if dist_to_target <= ARRIVAL_THRESHOLD:
-                    drone["location"] = (tx, ty)
+                if dist_to_target == 0.0:
                     self._handle_drone_arrival(drone_id, drone)
                     continue
 
@@ -2513,13 +2474,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 speed_multiplier = drone.get('ppo_speed_multiplier', 1.0)
 
                 # Move directly towards target (no heading guidance, since we removed that feature)
-                tgt_hx = to_target_dx / max(dist_to_target, 1e-6)
-                tgt_hy = to_target_dy / max(dist_to_target, 1e-6)
-
-                # Apply speed multiplier
                 step_len = min(speed * speed_multiplier, dist_to_target)
-                nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
-                ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
+                reached_target = step_len >= dist_to_target
+
+                if reached_target:
+                    nx, ny = tx, ty
+                else:
+                    tgt_hx = to_target_dx / dist_to_target
+                    tgt_hy = to_target_dy / dist_to_target
+                    nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
+                    ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
 
                 if "last_location" in drone:
                     step_distance = float(
@@ -2541,9 +2505,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
                 drone["location"] = (nx, ny)
 
-                new_dist = float(math.sqrt((tx - nx) ** 2 + (ty - ny) ** 2))
-                if new_dist <= ARRIVAL_THRESHOLD:
-                    drone["location"] = (tx, ty)
+                if reached_target:
                     self._handle_drone_arrival(drone_id, drone)
 
                 # Energy consumption model: E_step = e0 * d * (1 + alpha * load / max_capacity) * weather_battery_factor
@@ -2603,30 +2565,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 # Arrived at merchant - perform pickup
                 if order['status'] == OrderStatus.ASSIGNED and order.get('assigned_drone') == drone_id:
                     merchant_id = order.get('merchant_id')
-                    # Verify we're at the right merchant
                     if merchant_id and merchant_id in self.merchants:
-                        merchant_loc = self.merchants[merchant_id]['location']
-                        if self._calculate_euclidean_distance(drone['location'], merchant_loc) < ARRIVAL_THRESHOLD:
-                            # Perform pickup
-                            self.state_manager.update_order_status(
-                                serving_order_id, OrderStatus.PICKED_UP,
-                                reason=f"task_selection_pickup_at_merchant_{merchant_id}"
-                            )
-                            order['pickup_time'] = self.time_system.current_step
-                            drone['cargo'].add(serving_order_id)
+                        # Perform pickup (drone has arrived at merchant)
+                        self.state_manager.update_order_status(
+                            serving_order_id, OrderStatus.PICKED_UP,
+                            reason=f"task_selection_pickup_at_merchant_{merchant_id}"
+                        )
+                        order['pickup_time'] = self.time_system.current_step
+                        drone['cargo'].add(serving_order_id)
 
-                            # Validate customer location is present
-                            if not order.get('customer_location'):
-                                # No delivery target – undo pickup, release order back to READY
-                                drone['cargo'].discard(serving_order_id)
-                                self._reset_order_to_ready(serving_order_id,
-                                                           "task_selection_no_customer_location")
+                        # Validate customer location is present
+                        if not order.get('customer_location'):
+                            # No delivery target – undo pickup, release order back to READY
+                            drone['cargo'].discard(serving_order_id)
+                            self._reset_order_to_ready(serving_order_id,
+                                                       "task_selection_no_customer_location")
 
-                            # Pickup complete – go IDLE and wait for RL decision
-                            self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
-                                                                   target_location=None)
-                            drone['serving_order_id'] = None
-                            return
+                        # Pickup complete – go IDLE and wait for RL decision
+                        self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE,
+                                                               target_location=None)
+                        drone['serving_order_id'] = None
+                        return
 
                 # Pickup failed – release the ASSIGNED order back to READY
                 if order.get('assigned_drone') == drone_id and order['status'] == OrderStatus.ASSIGNED:
@@ -2638,10 +2597,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 # Arrived at customer - perform delivery
                 if order['status'] == OrderStatus.PICKED_UP and order.get('assigned_drone') == drone_id:
                     customer_loc = order.get('customer_location')
-                    # Verify we're at the right customer location
-                    if customer_loc and self._calculate_euclidean_distance(drone['location'],
-                                                                           customer_loc) < ARRIVAL_THRESHOLD:
-                        # Perform delivery
+                    if customer_loc:
+                        # Perform delivery (drone has arrived at customer)
                         self._complete_order_delivery(serving_order_id, drone_id)
 
                         # Remove from cargo
@@ -2828,6 +2785,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         base_loc = self.bases[drone['base']]['location']
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
+
+    def _force_return_due_to_low_battery(self, drone_id, drone):
+        """Force drone to return to base due to low battery."""
+        self._safe_reset_drone(drone_id, drone)
 
     def _handle_charging(self, drone_id, drone, speed_scale: float = 1.0):
         if drone['battery_level'] < 95:
