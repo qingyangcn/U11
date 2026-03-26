@@ -454,20 +454,14 @@ class LocationDataLoader:
 
         # 转换为numpy数组
         locations_array = np.array(all_locations)
-
         # 使用K-means聚类
         kmeans = KMeans(n_clusters=num_bases, random_state=42, n_init=10)
         kmeans.fit(locations_array)
-
         # 获取聚类中心作为基站位置
         base_locations = kmeans.cluster_centers_
-
         # 确保在网格范围内
         base_locations = np.clip(base_locations, 0, self.grid_size - 1)
-
-        print(f"K-means找到 {len(base_locations)} 个基站位置")
         return base_locations.tolist()
-
 
 
 # 帕累托优化器
@@ -607,7 +601,6 @@ class OrderDataProcessor:
                 elif col == 'distance':
                     df[col] = self.rng.exponential(3, len(df))
         return df
-
 
     def _analyze_order_patterns(self):
         """分析订单模式"""
@@ -807,7 +800,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  num_bases: Optional[int] = None,
                  top_k_merchants: int = 100,
                  reward_output_mode: str = "zero",
-                 enable_random_events: bool = False,  # 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
                  delivery_sla_steps: int = 6,  # READY-based delivery SLA in steps (increased for better pickup time)
                  timeout_factor: float = 4.0,  # Multiplier for deadline calculation (increased for better pickup time)
@@ -893,7 +885,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.fixed_objective_weights = self.fixed_objective_weights / (self.fixed_objective_weights.sum() + 1e-8)
         self.objective_weights = self.fixed_objective_weights.copy()
         self.reward_output_mode = str(reward_output_mode)
-        self.enable_random_events = bool(enable_random_events)
         self.debug_state_warnings = bool(debug_state_warnings)  # Task B: debug flag
         self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
         self.timeout_factor = float(timeout_factor)  # Deadline multiplier，已经用超时取消模型替代固定
@@ -1621,7 +1612,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._assigned_in_step = set()
         self._last_route_heading = action
 
-
         day_ended = self.time_system.step()
         time_state = self.time_system.get_time_state()
 
@@ -1829,39 +1819,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         if old_drone is not None and old_drone >= 0 and old_drone in self.drones:
             self.drones[old_drone]['current_load'] = max(0, self.drones[old_drone]['current_load'] - 1)
-
-    def _force_complete_order(self, order_id, drone_id):
-        """强制完成订单（用于异常状态恢复）（走 StateManager）"""
-        if order_id not in self.orders:
-            return
-
-        order = self.orders[order_id]
-        if order['status'] == OrderStatus.DELIVERED:
-            return
-
-        self.state_manager.update_order_status(order_id, OrderStatus.DELIVERED, reason="force_complete")
-        order['delivery_time'] = self.time_system.current_step
-        order['assigned_drone'] = -1
-
-        if drone_id in self.drones:
-            self.drones[drone_id]['orders_completed'] += 1
-            self.drones[drone_id]['current_load'] = max(0, self.drones[drone_id]['current_load'] - 1)
-
-        self.metrics['completed_orders'] += 1
-        self.daily_stats['orders_completed'] += 1
-
-        # Track waiting time
-        waiting_time = order['delivery_time'] - order['creation_time']
-        self.metrics['total_waiting_time'] += waiting_time
-        self.daily_stats['total_waiting_time'] = (
-                                                     self.daily_stats.get('total_waiting_time', 0)) + waiting_time
-
-        # Check if delivery was on-time using helper method
-        if self._is_order_on_time(order):
-            self.metrics['on_time_deliveries'] += 1
-            self.daily_stats['on_time_deliveries'] += 1
-        self.active_orders.discard(order_id)
-        self.completed_orders.add(order_id)
 
     # ------------------ overtime termination ------------------
 
@@ -2500,8 +2457,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         substep_scale = 1.0 / self.physics_substeps
         for _ in range(self.physics_substeps):
             self._update_drone_positions(speed_scale=substep_scale)
-        if self.enable_random_events:
-            self._handle_random_events()
 
     def _update_merchant_preparation(self):
         for merchant_id, merchant in self.merchants.items():
@@ -2629,14 +2584,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     # ------------------ 任务/到达处理（统一结算出口）------------------
     def _safe_reset_drone(self, drone_id, drone):
         """唯一出口：清理关联订单 + 返航"""
-
-        for order_id, order in list(self.orders.items()):
-            if order.get('assigned_drone') == drone_id:
-                if order['status'] == OrderStatus.PICKED_UP:
-                    self._force_complete_order(order_id, drone_id)
-                elif order['status'] == OrderStatus.ASSIGNED:
-                    self._reset_order_to_ready(order_id, "drone_reset")
-
         drone['cargo'] = set()
         drone['serving_order_id'] = None
         drone.pop('current_merchant_id', None)
@@ -2648,7 +2595,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _handle_drone_arrival(self, drone_id, drone):
         """
         Arrival handler (task-selection mode).
-
         - FLYING_TO_MERCHANT: perform pickup, then go IDLE and wait for RL decision.
         - FLYING_TO_CUSTOMER: perform delivery, then go IDLE.
         - No serving_order_id: reset to base.
@@ -2734,12 +2680,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             for oid in list(self.active_orders):
                 if oid not in self.orders:
                     continue
-                ord_ = self.orders[oid]
-                if ord_.get('assigned_drone') == drone_id:
-                    if ord_['status'] == OrderStatus.PICKED_UP:
-                        self._force_complete_order(oid, drone_id)
-                    elif ord_['status'] == OrderStatus.ASSIGNED:
-                        self._reset_order_to_ready(oid, "returning_base_arrival")
 
             if drone['battery_level'] < 80:
                 self.state_manager.update_drone_status(drone_id, DroneStatus.CHARGING, target_location=None)
@@ -2895,58 +2835,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
         drone['current_load'] = 0
 
-    def _force_return_due_to_low_battery(self, drone_id: int, drone: dict):
-        """
-        Force drone to return to base due to low battery.
-        Releases all undelivered orders (ASSIGNED and PICKED_UP) back to READY state.
-        """
-        # Track forced return event
-        self.daily_stats["forced_return_events"] = int(self.daily_stats.get("forced_return_events", 0)) + 1
-
-        # Release all orders assigned to this drone
-        # First collect order IDs to modify (more efficient than list copy of all active orders)
-        orders_to_release = [
-            order_id for order_id in self.active_orders
-            if order_id in self.orders and self.orders[order_id].get('assigned_drone') == drone_id
-        ]
-
-        for order_id in orders_to_release:
-            order = self.orders[order_id]
-
-            # Release ASSIGNED orders (not yet picked up)
-            if order['status'] == OrderStatus.ASSIGNED:
-                self.state_manager.update_order_status(
-                    order_id, OrderStatus.READY, reason="force_return_low_battery"
-                )
-                order['assigned_drone'] = None
-                # Clear assignment timestamp if present
-                if 'assigned_time' in order:
-                    del order['assigned_time']
-
-            # Release PICKED_UP orders (in cargo but not delivered)
-            # In paper-level simplification, allow "delivery failure recovery"
-            elif order['status'] == OrderStatus.PICKED_UP:
-                self.state_manager.update_order_status(
-                    order_id, OrderStatus.READY, reason="force_return_low_battery_pickup"
-                )
-                order['assigned_drone'] = None
-                # Clear pickup timestamp
-                if 'pickup_time' in order:
-                    del order['pickup_time']
-                # Remove from cargo
-                if order_id in drone.get('cargo', set()):
-                    drone['cargo'].discard(order_id)
-
-        # Clear drone task state
-        drone['cargo'] = set()
-        drone['serving_order_id'] = None
-        drone.pop('current_merchant_id', None)
-        drone['current_load'] = 0
-
-        # Set drone to return to base
-        base_loc = self.bases[drone['base']]['location']
-        self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE, target_location=base_loc)
-
     def _handle_charging(self, drone_id, drone, speed_scale: float = 1.0):
         if drone['battery_level'] < 95:
             drone['battery_level'] = min(
@@ -2956,51 +2844,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         else:
             self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
 
-    # ------------------ random events ------------------
-
-    def _handle_random_events(self):
-        cancellation_factor = self._get_weather_cancellation_factor()
-
-        for order_id in list(self.active_orders):
-            order = self.orders[order_id]
-
-            if (order['status'] in [OrderStatus.PENDING, OrderStatus.ACCEPTED] and
-                    self.np_random.random() < 0.02 * cancellation_factor):
-                self._cancel_order(order_id, "user_cancellation")
-
-            elif (order['status'] == OrderStatus.ACCEPTED and
-                  self.np_random.random() < self.merchants[order['merchant_id']]['cancellation_rate']):
-                self._cancel_order(order_id, "merchant_cancellation")
-
-            elif (order['status'] == OrderStatus.ASSIGNED and
-                  self.np_random.random() < self.drones[order['assigned_drone']][
-                      'cancellation_rate'] * cancellation_factor):
-                self._cancel_order(order_id, "drone_cancellation")
-
-            elif (order['status'] in [OrderStatus.ACCEPTED, OrderStatus.ASSIGNED] and
-                  self.np_random.random() < 0.01):
-                self._change_order_address(order_id)
-
-    def _get_weather_cancellation_factor(self):
-        if self.weather == WeatherType.SUNNY:
-            return 1.0
-        elif self.weather == WeatherType.RAINY:
-            return 1.5
-        elif self.weather == WeatherType.WINDY:
-            return 1.3
-        else:
-            return 2.0
-
-    def _change_order_address(self, order_id):
-        order = self.orders[order_id]
-        new_customer_location = self.location_loader.get_random_user_grid_location()
-        order['customer_location'] = new_customer_location
-
-        if order.get('assigned_drone', -1) >= 0 and order['status'] == OrderStatus.ASSIGNED:
-            drone_id = order['assigned_drone']
-            drone = self.drones[drone_id]
-            if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-                drone['target_location'] = new_customer_location
 
     # ------------------  weather ------------------
 
@@ -3706,7 +3549,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _update_system_state(self):
         pass
-
 
     def _get_info(self):
         info = {
