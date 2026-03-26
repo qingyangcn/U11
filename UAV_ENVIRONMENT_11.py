@@ -11,15 +11,12 @@ import math
 from sklearn.cluster import KMeans
 
 # ===== Constants for state management =====
-
-
-# ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
-
+ARRIVAL_THRESHOLD = 0.0  # Distance threshold for considering drone arrived at target
+DISTANCE_CLOSE_THRESHOLD = 0.0  # Distance threshold for decision point detection
 
 def set_global_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
-
 
 # 枚举定义
 class OrderStatus(Enum):
@@ -1771,8 +1768,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                               'route_preferences',
                               'current_task_distance', 'task_optimal_distance', 'trip_started',
                               'trip_actual_distance', 'trip_optimal_distance',
-                              'current_merchant_id', 'current_stop',
-                              'planned_stops', 'route_committed']
+                              'current_merchant_id', ]
             for key in keys_to_remove:
                 self.drones[i].pop(key, None)
 
@@ -1883,14 +1879,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if order['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
             return True
 
-        # Decision point if drone is exactly at its current target
-        if 'target_location' in drone and drone['location'] == drone['target_location']:
-            if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
-                # At merchant - decision point after pickup
-                return True
-            elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
-                # At customer - decision point after delivery
-                return True
+        # Decision point if close to current target
+        if 'target_location' in drone:
+            dist_to_target = self._get_dist_to_target(drone_id)
+
+            if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
+                if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
+                    # At merchant - decision point after pickup
+                    return True
+                elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
+                    # At customer - decision point after delivery
+                    return True
 
         return False
 
@@ -2500,7 +2499,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 to_target_dy = ty - cy
                 dist_to_target = float(math.sqrt(to_target_dx * to_target_dx + to_target_dy * to_target_dy))
 
-                if dist_to_target == 0.0:
+                ARRIVAL_THRESHOLD = 0.5
+                if dist_to_target <= ARRIVAL_THRESHOLD:
                     drone["location"] = (tx, ty)
                     self._handle_drone_arrival(drone_id, drone)
                     continue
@@ -2513,10 +2513,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 speed_multiplier = drone.get('ppo_speed_multiplier', 1.0)
 
                 # Move directly towards target (no heading guidance, since we removed that feature)
-                tgt_hx = to_target_dx / dist_to_target
-                tgt_hy = to_target_dy / dist_to_target
+                tgt_hx = to_target_dx / max(dist_to_target, 1e-6)
+                tgt_hy = to_target_dy / max(dist_to_target, 1e-6)
 
-                # Apply speed multiplier; cap at dist_to_target so we never overshoot
+                # Apply speed multiplier
                 step_len = min(speed * speed_multiplier, dist_to_target)
                 nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
                 ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
@@ -2541,7 +2541,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
                 drone["location"] = (nx, ny)
 
-                if step_len >= dist_to_target:
+                new_dist = float(math.sqrt((tx - nx) ** 2 + (ty - ny) ** 2))
+                if new_dist <= ARRIVAL_THRESHOLD:
                     drone["location"] = (tx, ty)
                     self._handle_drone_arrival(drone_id, drone)
 
